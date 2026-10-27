@@ -83,19 +83,32 @@ describe('Codex model commands', () => {
     expect(send).toHaveBeenCalledWith('chat-dm', { markdown: '当前是 OMP 会话，模型切换仅支持 Codex' }, { replyTo: 'message-1' });
   });
 
-  it('explains that a thread model does not exist before the first message', async () => {
+  it('opens model selection before a thread exists', async () => {
     const send = vi.fn().mockResolvedValue({ messageId: 'message-2' });
     const bindings = new JsonProjectBindingStore(join(await mkdtemp(join(tmpdir(), 'feishu-command-test-')), 'bindings.json'));
+    const listModels = vi.fn().mockResolvedValue([
+      {
+        model: 'gpt-5.6-sol', id: 'gpt-5.6-sol', displayName: 'Sol', description: '',
+        isDefault: true, hidden: false, supportedReasoningEfforts: ['low', 'high'], defaultReasoningEffort: 'high',
+      },
+      {
+        model: 'gpt-6-astra', id: 'gpt-6-astra', displayName: 'Astra', description: '',
+        isDefault: false, hidden: false, supportedReasoningEfforts: ['medium', 'ultra'], defaultReasoningEffort: 'medium',
+      },
+    ]);
     const ctx = context({ send }, bindings);
     ctx.controls.cfg = {
       accounts: { app: { id: 'app-1', secret: 'secret', tenant: 'feishu' } },
       preferences: { agentBackend: 'codex' },
     } as never;
+    ctx.agent = { ...ctx.agent, listModels };
 
     await runCommandHandler('model', '', ctx);
 
     const card = JSON.stringify(send.mock.lastCall![1].card);
-    expect(card).toContain('尚未开始（发送第一条消息后才有会话模型）');
+    expect(card).toContain('Sol');
+    expect(card).toContain('Astra');
+    expect(card).not.toContain('尚未开始');
   });
 
   it('walks a project topic through model and effort selection and applies the switch', async () => {
@@ -258,6 +271,98 @@ describe('Codex model commands', () => {
     expect(switchThreadModel).not.toHaveBeenCalled();
     const card = JSON.stringify(patch.mock.lastCall![0].data.content);
     expect(card).toContain('模型列表已更新，请重新选择');
+  });
+
+  it('stores a pending choice before a session exists', async () => {
+    const send = vi.fn().mockResolvedValue({ messageId: 'message-2' });
+    const bindings = new JsonProjectBindingStore(join(await mkdtemp(join(tmpdir(), 'feishu-command-test-')), 'bindings.json'));
+    const listModels = vi.fn().mockResolvedValue([
+      {
+        model: 'gpt-5.6-sol', id: 'gpt-5.6-sol', displayName: 'Sol', description: '',
+        isDefault: true, hidden: false, supportedReasoningEfforts: ['low', 'high'], defaultReasoningEffort: 'high',
+      },
+      {
+        model: 'gpt-6-astra', id: 'gpt-6-astra', displayName: 'Astra', description: '',
+        isDefault: false, hidden: false, supportedReasoningEfforts: ['medium', 'ultra'], defaultReasoningEffort: 'medium',
+      },
+    ]);
+    const switchThreadModel = vi.fn();
+    const ctx = context({ send }, bindings);
+    ctx.controls.cfg = {
+      accounts: { app: { id: 'app-1', secret: 'secret', tenant: 'feishu' } },
+      preferences: { agentBackend: 'codex' },
+    } as never;
+    ctx.agent = { ...ctx.agent, listModels, switchThreadModel };
+
+    await runCommandHandler('model', '', ctx);
+    ctx.formValue = { model_id: 'gpt-6-astra' };
+    ctx.cardPayload = { cmd: 'model', arg: 'choose-model' };
+    await runCommandHandler('model', 'choose-model', ctx);
+    ctx.formValue = { effort: 'ultra' };
+    ctx.cardPayload = { cmd: 'model', arg: 'apply', model_id: 'gpt-6-astra' };
+    await runCommandHandler('model', 'apply', ctx);
+
+    expect(ctx.sessions.getPending('chat-dm')).toEqual({ model: 'gpt-6-astra', effort: 'ultra' });
+    expect(switchThreadModel).not.toHaveBeenCalled();
+    const card = JSON.stringify(send.mock.lastCall![1].card);
+    expect(card).toContain('已选择 Astra；会话创建后生效');
+    expect(card).toContain('推理强度：最高');
+  });
+
+  it('shows a pending choice on the status card before a session exists', async () => {
+    const send = vi.fn().mockResolvedValue({ messageId: 'message-2' });
+    const bindings = new JsonProjectBindingStore(join(await mkdtemp(join(tmpdir(), 'feishu-command-test-')), 'bindings.json'));
+    const listModels = vi.fn().mockResolvedValue([{
+      model: 'gpt-6-astra', id: 'gpt-6-astra', displayName: 'Astra', description: '',
+      isDefault: false, hidden: false, supportedReasoningEfforts: ['medium', 'ultra'], defaultReasoningEffort: 'medium',
+    }]);
+    const ctx = context({ send }, bindings);
+    ctx.controls.cfg = {
+      accounts: { app: { id: 'app-1', secret: 'secret', tenant: 'feishu' } },
+      preferences: { agentBackend: 'codex' },
+    } as never;
+    ctx.agent = { ...ctx.agent, listModels };
+    ctx.sessions.setPending('chat-dm', { model: 'gpt-6-astra', effort: 'ultra' });
+
+    await runCommandHandler('status', '', ctx);
+
+    const card = JSON.stringify(send.mock.lastCall![1].card);
+    expect(card).toContain('模型：Astra（待生效）');
+  });
+
+  it('keeps the pending choice when starting a new session', async () => {
+    const send = vi.fn().mockResolvedValue({ messageId: 'message-2' });
+    const bindings = new JsonProjectBindingStore(join(await mkdtemp(join(tmpdir(), 'feishu-command-test-')), 'bindings.json'));
+    const listModels = vi.fn().mockResolvedValue([{
+      model: 'gpt-6-astra', id: 'gpt-6-astra', displayName: 'Astra', description: '',
+      isDefault: false, hidden: false, supportedReasoningEfforts: ['medium', 'ultra'], defaultReasoningEffort: 'medium',
+    }]);
+    const ctx = context({ send }, bindings);
+    ctx.controls.cfg = {
+      accounts: { app: { id: 'app-1', secret: 'secret', tenant: 'feishu' } },
+      preferences: { agentBackend: 'codex' },
+    } as never;
+    ctx.agent = { ...ctx.agent, listModels };
+    ctx.sessions.set('chat-dm', 'thread-old', '/tmp/demo');
+    ctx.sessions.setPending('chat-dm', { model: 'gpt-6-astra', effort: 'ultra' });
+
+    await runCommandHandler('new', '', ctx);
+
+    expect(ctx.sessions.getRaw('chat-dm')?.sessionId).toBeUndefined();
+    expect(ctx.sessions.getPending('chat-dm')).toEqual({ model: 'gpt-6-astra', effort: 'ultra' });
+    expect(send).toHaveBeenCalledWith('chat-dm', {
+      markdown: '已开始新会话；模型选择保留：Astra（待生效）。',
+    }, { replyTo: 'message-1' });
+  });
+
+  it('refuses /model default on the OMP backend', async () => {
+    const send = vi.fn().mockResolvedValue({ messageId: 'message-2' });
+    const bindings = new JsonProjectBindingStore(join(await mkdtemp(join(tmpdir(), 'feishu-command-test-')), 'bindings.json'));
+    const ctx = context({ send }, bindings);
+
+    await runCommandHandler('model', 'default', ctx);
+
+    expect(send).toHaveBeenCalledWith('chat-dm', { markdown: '当前是 OMP 会话，模型切换仅支持 Codex' }, { replyTo: 'message-1' });
   });
 
   it('refuses to switch while this topic has an active run', async () => {

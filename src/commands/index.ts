@@ -16,6 +16,7 @@ import {
   effortSelectCard,
   modelErrorCard,
   modelNoticeCard,
+  modelPendingCard,
   modelSelectCard,
   modelSwitchSuccessCard,
 } from '../card/model-cards';
@@ -312,8 +313,22 @@ async function handleNew(args: string, ctx: CommandContext): Promise<void> {
   }
 
   const wasRunning = ctx.activeRuns.interrupt(ctx.scope);
-  ctx.sessions.clear(ctx.scope);
-  await reply(ctx, wasRunning ? '已中断当前任务并开始新会话。' : '已开始新会话。');
+  const pending = ctx.sessions.getPending(ctx.scope);
+  ctx.sessions.clearSession(ctx.scope);
+  if (!pending) {
+    await reply(ctx, wasRunning ? '已中断当前任务并开始新会话。' : '已开始新会话。');
+    return;
+  }
+  try {
+    const models = await listModelOptions(ctx, true);
+    const name = modelDisplayName(models, pending.model);
+    await reply(
+      ctx,
+      `${wasRunning ? '已中断当前任务并开始新会话' : '已开始新会话'}；模型选择保留：${name}（待生效）。`,
+    );
+  } finally {
+    await releaseWriterIfAllIdle(ctx.activeRuns, ctx.agent);
+  }
 }
 
 async function handleWelcome(_args: string, ctx: CommandContext): Promise<void> {
@@ -902,12 +917,21 @@ async function handleWsRemove(name: string, ctx: CommandContext): Promise<void> 
   await reply(ctx, `✓ 已删除工作空间：\`${name}\``);
 }
 
+async function pendingModelName(ctx: CommandContext, modelId: string): Promise<string> {
+  const models = await listModelOptions(ctx, true);
+  return modelDisplayName(models, modelId);
+}
+
 async function readStatusModel(ctx: CommandContext, threadId?: string): Promise<StatusModelInfo | undefined> {
-  if (ctx.agent.id !== 'codex' || !ctx.agent.readThreadModel) return undefined;
-  if (!threadId) return {};
+  if (ctx.agent.id !== 'codex') return undefined;
+  const pending = ctx.sessions.getPending(ctx.scope);
+  const pendingDisplayName = pending ? await pendingModelName(ctx, pending.model) : undefined;
+  const pendingInfo: StatusModelInfo = pendingDisplayName ? { pendingDisplayName } : {};
+  if (!threadId) return pendingDisplayName ? pendingInfo : {};
+  if (!ctx.agent.readThreadModel) return pendingDisplayName ? pendingInfo : {};
   try {
     const state = await ctx.agent.readThreadModel(threadId);
-    if (!state.model) return { readFailed: true };
+    if (!state.model) return { readFailed: true, ...pendingInfo };
     const modelId = state.model;
     let displayName = modelId;
     if (ctx.agent.listModels) {
@@ -922,13 +946,13 @@ async function readStatusModel(ctx: CommandContext, threadId?: string): Promise<
         });
       }
     }
-    return { displayName, effort: state.effort ?? undefined };
+    return { displayName, effort: state.effort ?? undefined, ...pendingInfo };
   } catch (err) {
     log.warn('commands', 'status-model-read-failed', {
       threadId,
       error: err instanceof Error ? err.message : String(err),
     });
-    return { readFailed: true };
+    return { readFailed: true, ...pendingInfo };
   }
 }
 
@@ -1035,13 +1059,15 @@ async function addCurrentModel(
 
 async function openModelStep1(
   ctx: CommandContext,
-  threadId: string,
+  threadId: string | undefined,
   notice?: string,
 ): Promise<void> {
-  const state = await readModelState(ctx, threadId);
+  const state = threadId ? await readModelState(ctx, threadId) : undefined;
+  const pending = threadId ? undefined : ctx.sessions.getPending(ctx.scope);
+  const currentModel = state?.model ?? pending?.model ?? null;
   const models = await listModelOptions(ctx, false);
   if (!models) {
-    const current = state?.model ? `当前模型：${modelDisplayName(undefined, state.model)}。` : '';
+    const current = currentModel ? `当前模型：${modelDisplayName(undefined, currentModel)}。` : '';
     await sendCommandCard(ctx, modelErrorCard(
       '无法读取模型列表',
       [current, '读取模型列表失败，请稍后重试。'].filter(Boolean).join('\n'),
@@ -1049,7 +1075,7 @@ async function openModelStep1(
     return;
   }
   if (models.length === 0) {
-    const current = state?.model ? `当前模型：${modelDisplayName(undefined, state.model)}。` : '';
+    const current = currentModel ? `当前模型：${modelDisplayName(undefined, currentModel)}。` : '';
     await sendCommandCard(ctx, modelErrorCard(
       '没有可用模型',
       [current, '模型列表为空，请稍后重试。'].filter(Boolean).join('\n'),
@@ -1057,19 +1083,20 @@ async function openModelStep1(
     return;
   }
   await sendCommandCard(ctx, modelSelectCard(
-    await addCurrentModel(ctx, models, state?.model),
-    state?.model,
+    await addCurrentModel(ctx, models, currentModel),
+    currentModel,
     notice,
   ));
 }
 
-async function openModelStep2(ctx: CommandContext, threadId: string): Promise<void> {
+async function openModelStep2(ctx: CommandContext, threadId: string | undefined): Promise<void> {
   const modelId = modelIdFromForm(ctx);
   if (!modelId) {
     await openModelStep1(ctx, threadId);
     return;
   }
-  const state = await readModelState(ctx, threadId);
+  const state = threadId ? await readModelState(ctx, threadId) : undefined;
+  const pending = threadId ? undefined : ctx.sessions.getPending(ctx.scope);
   const models = await listModelOptions(ctx, true);
   if (!models) {
     await sendCommandCard(ctx, modelErrorCard('无法读取模型列表', '读取模型列表失败，请稍后重试。'));
@@ -1084,10 +1111,10 @@ async function openModelStep2(ctx: CommandContext, threadId: string): Promise<vo
     await openModelStep1(ctx, threadId, '该模型没有可用的推理强度，请换一个模型。');
     return;
   }
-  await sendCommandCard(ctx, effortSelectCard(model, state?.effort));
+  await sendCommandCard(ctx, effortSelectCard(model, state?.effort ?? pending?.effort));
 }
 
-async function applyModelChoice(ctx: CommandContext, threadId: string): Promise<void> {
+async function applyModelChoice(ctx: CommandContext, threadId: string | undefined): Promise<void> {
   const modelId = modelIdFromForm(ctx);
   const requestedEffort = effortFromForm(ctx);
   if (!modelId || !requestedEffort) {
@@ -1115,12 +1142,27 @@ async function applyModelChoice(ctx: CommandContext, threadId: string): Promise<
     await openModelStep1(ctx, threadId, '模型列表已更新，请重新选择');
     return;
   }
+  if (!threadId) {
+    ctx.sessions.setPending(ctx.scope, { model: model.model, effort });
+    log.info('command', 'model-select-pending', {
+      scope: ctx.scope,
+      operatorId: ctx.msg.senderId.slice(-6),
+      operatorName: ctx.msg.senderName,
+      nextModel: model.model,
+      nextEffort: effort,
+    });
+    await sendCommandCard(ctx, modelPendingCard(model.displayName, effort));
+    return;
+  }
   if (!ctx.agent.switchThreadModel) {
     await sendCommandCard(ctx, modelErrorCard('无法切换模型', '当前后端不支持切换模型。'));
     return;
   }
   const before = await readModelState(ctx, threadId);
   const result: ModelSwitchResult = await ctx.agent.switchThreadModel(threadId, { model: model.model, effort });
+  if (result.status === 'applied' || result.status === 'failed') {
+    ctx.sessions.clearPending(ctx.scope);
+  }
   const previousModelId = result.previous?.model ?? before?.model ?? null;
   const previousEffort = result.previous?.effort ?? before?.effort ?? null;
   log.info('command', 'model-switch', {
@@ -1193,13 +1235,6 @@ async function handleModelInner(args: string, ctx: CommandContext): Promise<void
     return;
   }
   const threadId = await modelThreadId(ctx);
-  if (!threadId) {
-    await sendCommandCard(ctx, modelErrorCard(
-      '尚未开始',
-      '尚未开始（发送第一条消息后才有会话模型）',
-    ));
-    return;
-  }
   const command = args.trim();
   if (!command || command === 'reload' || command === 'back') {
     await openModelStep1(ctx, threadId);

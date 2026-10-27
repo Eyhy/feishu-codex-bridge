@@ -719,34 +719,201 @@ export class CodexAdapter implements AgentAdapter {
       });
     };
 
+    const pendingChoice: ModelChoice | undefined =
+      opts.pendingModel && opts.pendingEffort
+        ? { model: opts.pendingModel, effort: opts.pendingEffort }
+        : undefined;
+
+    const modelLabel = async (modelId: string): Promise<string> => {
+      try {
+        const models = await this.listModels({ includeHidden: true });
+        return models.find((model) => model.model === modelId || model.id === modelId)?.displayName ?? modelId;
+      } catch {
+        return modelId;
+      }
+    };
+
+    const emitPendingFailure = (
+      status: 'failed' | 'active_writer' | 'validation_failed',
+      message: string,
+    ): void => {
+      queue.push({ type: 'model_switch', status, next: pendingChoice, message });
+      queue.push({ type: 'error', message });
+      finish();
+    };
+
+    const validatePending = async (): Promise<{
+      kind: 'ok' | 'skip' | 'empty' | 'model_missing' | 'effort_missing';
+      model?: ModelOption;
+    }> => {
+      if (!pendingChoice) return { kind: 'ok' };
+      let models: ModelOption[];
+      try {
+        models = await this.listModels({ includeHidden: true });
+      } catch {
+        return { kind: 'skip' };
+      }
+      if (models.length === 0) return { kind: 'empty' };
+      const check = (list: ModelOption[]): { kind: 'ok' | 'model_missing' | 'effort_missing'; model?: ModelOption } => {
+        const model = list.find((item) => item.model === pendingChoice.model || item.id === pendingChoice.model);
+        if (!model) return { kind: 'model_missing' };
+        if (!model.supportedReasoningEfforts.includes(pendingChoice.effort)) {
+          return { kind: 'effort_missing', model };
+        }
+        return { kind: 'ok', model };
+      };
+      const first = check(models);
+      if (first.kind === 'ok') return first;
+      try {
+        models = await this.listModels({ includeHidden: true, forceRefresh: true });
+      } catch {
+        return { kind: 'skip' };
+      }
+      if (models.length === 0) return { kind: 'empty' };
+      return check(models);
+    };
+
+    const checkPending = async (): Promise<boolean> => {
+      if (!pendingChoice) return true;
+      const validation = await validatePending();
+      if (validation.kind === 'skip') return true;
+      if (validation.kind === 'empty') {
+        emitPendingFailure('validation_failed', '模型列表暂时为空，无法应用待生效模型，请稍后重试。');
+        return false;
+      }
+      if (validation.kind === 'model_missing') {
+        emitPendingFailure(
+          'failed',
+          `待生效的模型 ${pendingChoice.model} 在这台设备上不可用。请重新选择模型。`,
+        );
+        return false;
+      }
+      if (validation.kind === 'effort_missing') {
+        emitPendingFailure(
+          'failed',
+          `待生效的模型 ${pendingChoice.model} 不支持强度 ${pendingChoice.effort}。请重新选择。`,
+        );
+        return false;
+      }
+      return true;
+    };
+
     const start = async (): Promise<void> => {
       try {
         await this.client.ensureStarted();
         unsubscribe = this.client.onNotification(handleNotification);
         unsubscribeRequests = this.client.onServerRequest(handleServerRequest);
         let thread: ThreadResponse;
+        let resumed = false;
         if (opts.sessionId) {
           try {
             thread = await client.request('thread/resume', {
               threadId: opts.sessionId,
               ...(opts.cwd ? { cwd: opts.cwd } : {}),
-          });
+            });
+            resumed = true;
           } catch (err) {
+            if (isActiveWriterError(err) && pendingChoice) {
+              emitPendingFailure('active_writer', CODEX_ACTIVE_WRITER_MESSAGE);
+              return;
+            }
             if (!isMissingRolloutError(err)) throw err;
             queue.push({ type: 'ui_notice', message: '原 Codex 会话没有可恢复的执行记录，已自动新建会话。', level: 'warning' });
             thread = await this.startThread(opts.cwd);
           }
         } else {
+          if (!(await checkPending())) return;
           thread = await this.startThread(opts.cwd);
         }
         threadId = thread.thread?.id ?? thread.id ?? opts.sessionId;
         if (!threadId) throw new Error('Codex app-server did not return a thread id');
+        // A newly started thread has no earlier user choice to report; its
+        // device default is not a previous model.
+        const previous = resumed
+          ? {
+              model: typeof thread.thread?.model === 'string' && thread.thread.model.trim() ? thread.thread.model.trim() : null,
+              effort: typeof thread.thread?.reasoningEffort === 'string' && thread.thread.reasoningEffort.trim()
+                ? thread.thread.reasoningEffort.trim()
+                : null,
+            }
+          : undefined;
+        if (resumed && pendingChoice && !(await checkPending())) return;
         const currentName = typeof thread.thread?.name === 'string' ? thread.thread.name : undefined;
         const requestedName = opts.title?.replace(/\s+/g, ' ').trim();
         if (requestedName && currentName !== requestedName) {
           await this.setThreadName(threadId, requestedName);
         }
         queue.push({ type: 'system', sessionId: threadId, cwd: opts.cwd });
+        if (pendingChoice) {
+          let writeOk = true;
+          try {
+            await client.request('thread/settings/update', {
+              threadId,
+              model: pendingChoice.model,
+              effort: pendingChoice.effort,
+            });
+          } catch (err) {
+            if (isActiveWriterError(err)) {
+              emitPendingFailure('active_writer', CODEX_ACTIVE_WRITER_MESSAGE);
+              return;
+            }
+            writeOk = false;
+            const message = errorMessage(err);
+            if (resumed) {
+              queue.push({ type: 'model_switch', status: 'failed', next: pendingChoice, message });
+              queue.push({ type: 'ui_notice', message, level: 'warning' });
+            } else {
+              emitPendingFailure('failed', message);
+              return;
+            }
+          }
+          if (writeOk) {
+            let after: ThreadModelState | undefined;
+            let readError: unknown;
+            for (let attempt = 0; attempt < 2 && !after; attempt += 1) {
+              try {
+                after = await this.readThreadModel(threadId);
+                readError = undefined;
+              } catch (err) {
+                readError = err;
+              }
+            }
+            if (!after) {
+              queue.push({
+                type: 'model_switch',
+                status: 'unconfirmed',
+                next: pendingChoice,
+                message: errorMessage(readError),
+              });
+              queue.push({
+                type: 'ui_notice',
+                message: '模型设置已提交但未能确认，本轮先用线程当前设置执行；稍后重试。',
+                level: 'warning',
+              });
+            } else if (after.model !== pendingChoice.model || after.effort !== pendingChoice.effort) {
+              queue.push({
+                type: 'model_switch',
+                status: 'failed',
+                previous,
+                next: pendingChoice,
+                message: '模型设置已提交，但回读结果与选择不一致',
+              });
+              queue.push({
+                type: 'ui_notice',
+                message: '模型设置已提交，但回读结果与选择不一致，本轮将使用线程当前设置。',
+                level: 'warning',
+              });
+            } else {
+              const from = previous?.model ? await modelLabel(previous.model) : undefined;
+              const to = await modelLabel(pendingChoice.model);
+              queue.push({ type: 'model_switch', status: 'applied', previous, next: pendingChoice });
+              queue.push({
+                type: 'ui_notice',
+                message: from ? `模型已切换：${from} → ${to}` : `模型已切换：${to}`,
+              });
+            }
+          }
+        }
         const turn = await requestTurn<{ id?: string; turn?: { id?: string } }>('turn/start', {
           threadId,
           input: [{ type: 'text', text: opts.prompt, text_elements: [] }],

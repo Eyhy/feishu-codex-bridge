@@ -6,7 +6,7 @@ import { CODEX_ACTIVE_WRITER_MESSAGE, CodexAdapter } from './adapter';
 import { ThreadModelReadError } from '../types';
 import type { AgentEvent } from '../types';
 
-async function fakeCodex(options: { rejectDesktopMetadata?: boolean; rejectAdditionalContext?: boolean; interaction?: 'questions' | 'approval'; activeWriter?: boolean; ignoreSettings?: boolean } = {}): Promise<string> {
+async function fakeCodex(options: { rejectDesktopMetadata?: boolean; rejectAdditionalContext?: boolean; interaction?: 'questions' | 'approval'; activeWriter?: boolean; ignoreSettings?: boolean; modelListFailure?: 'throw' | 'empty'; settingsFailure?: boolean; readFailure?: boolean } = {}): Promise<string> {
   const dir = await mkdtemp(join(tmpdir(), 'codex-adapter-test-'));
   const path = join(dir, 'codex-fake.mjs');
   await writeFile(path, `#!/usr/bin/env node
@@ -21,6 +21,9 @@ const rejectAdditionalContext = ${JSON.stringify(Boolean(options.rejectAdditiona
 const interaction = ${JSON.stringify(options.interaction ?? '')};
 const activeWriter = ${JSON.stringify(Boolean(options.activeWriter))};
 const ignoreSettings = ${JSON.stringify(Boolean(options.ignoreSettings))};
+const modelListFailure = ${JSON.stringify(options.modelListFailure ?? '')};
+const settingsFailure = ${JSON.stringify(Boolean(options.settingsFailure))};
+const readFailure = ${JSON.stringify(Boolean(options.readFailure))};
 const threadSettings = new Map([
   ['thread-existing', { model: 'gpt-5.6-sol', effort: 'high' }],
   ['thread-cold', { model: 'gpt-5.6-sol', effort: 'high' }],
@@ -29,16 +32,21 @@ const loadedThreads = new Set(['thread-existing']);
 for (const signal of ['SIGTERM', 'SIGINT']) process.on(signal, () => { appendFileSync(requestLog, JSON.stringify({ event: 'app-server-exit', signal }) + '\\n'); process.exit(0); });
 let activeThreadId = 'thread-new';
 let activeThreadName = '';
+let settingsWritten = false;
 for await (const line of rl) {
   const msg = JSON.parse(line);
   if (msg.method) appendFileSync(requestLog, JSON.stringify({ method: msg.method, params: msg.params }) + '\\n');
   if (msg.method === 'initialize') send({ id: msg.id, result: {} });
   if (msg.method === 'thread/list') send({ id: msg.id, result: { data: [{ id: 'thread-existing', name: msg.params.searchTerm ? '匹配会话' : activeThreadName || '旧会话', preview: '修复卡片', cwd: '/tmp/project', updatedAt: 10, status: { type: 'idle' } }], nextCursor: msg.params.cursor ? null : 'cursor-2', backwardsCursor: null } });
-  if (msg.method === 'model/list') send({ id: msg.id, result: { data: [
-    { id: 'gpt-5.6-sol', model: 'gpt-5.6-sol', displayName: 'Sol', description: '默认模型', hidden: false, isDefault: true, defaultReasoningEffort: 'high', supportedReasoningEfforts: [{ description: '低', reasoningEffort: 'low' }, { description: '高', reasoningEffort: 'high' }] },
-    { id: 'gpt-6-astra', model: 'gpt-6-astra', displayName: 'Astra', description: '实验模型', hidden: false, isDefault: false, defaultReasoningEffort: 'medium', supportedReasoningEfforts: [{ description: '中', reasoningEffort: 'medium' }, { description: '最高', reasoningEffort: 'ultra' }] },
-    { id: 'hidden-model', model: 'hidden-model', displayName: 'Hidden', description: '', hidden: true, isDefault: false, defaultReasoningEffort: 'low', supportedReasoningEfforts: [] },
-  ] } });
+  if (msg.method === 'model/list') {
+    if (modelListFailure === 'throw') send({ id: msg.id, error: { code: -32000, message: 'model list unavailable' } });
+    else if (modelListFailure === 'empty') send({ id: msg.id, result: { data: [] } });
+    else send({ id: msg.id, result: { data: [
+      { id: 'gpt-5.6-sol', model: 'gpt-5.6-sol', displayName: 'Sol', description: '默认模型', hidden: false, isDefault: true, defaultReasoningEffort: 'high', supportedReasoningEfforts: [{ description: '低', reasoningEffort: 'low' }, { description: '高', reasoningEffort: 'high' }] },
+      { id: 'gpt-6-astra', model: 'gpt-6-astra', displayName: 'Astra', description: '实验模型', hidden: false, isDefault: false, defaultReasoningEffort: 'medium', supportedReasoningEfforts: [{ description: '中', reasoningEffort: 'medium' }, { description: '最高', reasoningEffort: 'ultra' }] },
+      { id: 'hidden-model', model: 'hidden-model', displayName: 'Hidden', description: '', hidden: true, isDefault: false, defaultReasoningEffort: 'low', supportedReasoningEfforts: [] },
+    ] } });
+  }
   if (msg.method === 'thread/start') {
     if (rejectDesktopMetadata && msg.params.threadSource) {
       send({ id: msg.id, error: { code: -32602, message: 'unknown field threadSource' } });
@@ -60,7 +68,8 @@ for await (const line of rl) {
     else { activeThreadId = msg.params.threadId; loadedThreads.add(msg.params.threadId); send({ id: msg.id, result: { thread: { id: msg.params.threadId, cwd: '/tmp/project' } } }); }
   }
   if (msg.method === 'thread/read') {
-    if (msg.params.threadId === 'missing-thread') send({ id: msg.id, error: { code: -32000, message: 'thread not found: missing-thread' } });
+    if (readFailure && settingsWritten) send({ id: msg.id, error: { code: -32000, message: 'thread read failed after settings' } });
+    else if (msg.params.threadId === 'missing-thread') send({ id: msg.id, error: { code: -32000, message: 'thread not found: missing-thread' } });
     else if (msg.params.threadId === 'unloaded') send({ id: msg.id, error: { code: -32000, message: 'thread not loaded: unloaded' } });
     else {
       const settings = threadSettings.get(msg.params.threadId) ?? { model: 'gpt-5.6-sol', effort: 'high' };
@@ -72,8 +81,12 @@ for await (const line of rl) {
     send({ id: msg.id, result: {} });
   }
   if (msg.method === 'thread/settings/update') {
-    if (!ignoreSettings) threadSettings.set(msg.params.threadId, { model: msg.params.model, effort: msg.params.effort });
-    send({ id: msg.id, result: {} });
+    if (settingsFailure) send({ id: msg.id, error: { code: -32000, message: 'settings update failed' } });
+    else {
+      settingsWritten = true;
+      if (!ignoreSettings) threadSettings.set(msg.params.threadId, { model: msg.params.model, effort: msg.params.effort });
+      send({ id: msg.id, result: {} });
+    }
   }
   if (msg.method === 'turn/start') {
     if (rejectAdditionalContext && msg.params.additionalContext) {
@@ -486,6 +499,228 @@ describe('CodexAdapter', () => {
     expect(requests.filter((request) => request.method === 'thread/resume')).toHaveLength(1);
     expect(requests.some((request) => request.method === 'thread/start')).toBe(false);
     expect(requests.some((request) => request.method === 'thread/fork')).toBe(false);
+    await adapter.close();
+  });
+
+  it('applies a pending choice to a new thread before the first turn', async () => {
+    const binary = await fakeCodex();
+    const adapter = new CodexAdapter({ binary });
+    const events = await collect(adapter.run({
+      prompt: '第一轮',
+      cwd: '/tmp/project',
+      pendingModel: 'gpt-6-astra',
+      pendingEffort: 'ultra',
+    }).events);
+    expect(events).toContainEqual({
+      type: 'model_switch',
+      status: 'applied',
+      next: { model: 'gpt-6-astra', effort: 'ultra' },
+    });
+    expect(events).toContainEqual({ type: 'ui_notice', message: '模型已切换：Astra' });
+    const requests = await readRequests(binary);
+    const methods = requests.map((request) => request.method);
+    expect(methods.indexOf('model/list')).toBeLessThan(methods.indexOf('thread/start'));
+    expect(methods.indexOf('thread/start')).toBeLessThan(methods.indexOf('thread/settings/update'));
+    expect(methods.indexOf('thread/settings/update')).toBeLessThan(methods.indexOf('thread/read'));
+    expect(methods.indexOf('thread/read')).toBeLessThan(methods.indexOf('turn/start'));
+    expect(requests.find((request) => request.method === 'thread/settings/update')?.params).toEqual({
+      threadId: 'thread-new',
+      model: 'gpt-6-astra',
+      effort: 'ultra',
+    });
+    expect(requests.find((request) => request.method === 'turn/start')?.params).not.toHaveProperty('model');
+    await adapter.close();
+  });
+
+  it('rejects an unavailable pending model before creating a thread', async () => {
+    const binary = await fakeCodex();
+    const adapter = new CodexAdapter({ binary });
+    const events = await collect(adapter.run({
+      prompt: '第一轮',
+      cwd: '/tmp/project',
+      pendingModel: 'missing-model',
+      pendingEffort: 'medium',
+    }).events);
+    expect(events).toContainEqual({
+      type: 'model_switch',
+      status: 'failed',
+      next: { model: 'missing-model', effort: 'medium' },
+      message: '待生效的模型 missing-model 在这台设备上不可用。请重新选择模型。',
+    });
+    expect(events).toContainEqual({
+      type: 'error',
+      message: '待生效的模型 missing-model 在这台设备上不可用。请重新选择模型。',
+    });
+    const requests = await readRequests(binary);
+    expect(requests.some((request) => request.method === 'thread/start')).toBe(false);
+    expect(requests.some((request) => request.method === 'turn/start')).toBe(false);
+    expect(requests.some((request) => request.method === 'thread/settings/update')).toBe(false);
+    await adapter.close();
+  });
+
+  it('rejects an unsupported pending effort before creating a thread', async () => {
+    const binary = await fakeCodex();
+    const adapter = new CodexAdapter({ binary });
+    const events = await collect(adapter.run({
+      prompt: '第一轮',
+      cwd: '/tmp/project',
+      pendingModel: 'gpt-6-astra',
+      pendingEffort: 'high',
+    }).events);
+    expect(events).toContainEqual({
+      type: 'model_switch',
+      status: 'failed',
+      next: { model: 'gpt-6-astra', effort: 'high' },
+      message: '待生效的模型 gpt-6-astra 不支持强度 high。请重新选择。',
+    });
+    const requests = await readRequests(binary);
+    expect(requests.some((request) => request.method === 'thread/start')).toBe(false);
+    await adapter.close();
+  });
+
+  it('reports an empty model list as a validation failure without creating a thread', async () => {
+    const binary = await fakeCodex({ modelListFailure: 'empty' });
+    const adapter = new CodexAdapter({ binary });
+    const events = await collect(adapter.run({
+      prompt: '第一轮',
+      cwd: '/tmp/project',
+      pendingModel: 'gpt-6-astra',
+      pendingEffort: 'medium',
+    }).events);
+    expect(events).toContainEqual({
+      type: 'model_switch',
+      status: 'validation_failed',
+      next: { model: 'gpt-6-astra', effort: 'medium' },
+      message: '模型列表暂时为空，无法应用待生效模型，请稍后重试。',
+    });
+    const requests = await readRequests(binary);
+    expect(requests.some((request) => request.method === 'thread/start')).toBe(false);
+    await adapter.close();
+  });
+
+  it('skips pending validation when model/list fails and still applies the choice', async () => {
+    const binary = await fakeCodex({ modelListFailure: 'throw' });
+    const adapter = new CodexAdapter({ binary });
+    const events = await collect(adapter.run({
+      prompt: '第一轮',
+      cwd: '/tmp/project',
+      pendingModel: 'gpt-6-astra',
+      pendingEffort: 'ultra',
+    }).events);
+    expect(events).toContainEqual({
+      type: 'model_switch',
+      status: 'applied',
+      next: { model: 'gpt-6-astra', effort: 'ultra' },
+    });
+    const requests = await readRequests(binary);
+    expect(requests.some((request) => request.method === 'thread/start')).toBe(true);
+    expect(requests.some((request) => request.method === 'thread/settings/update')).toBe(true);
+    await adapter.close();
+  });
+
+  it('stops a new thread when its pending settings write fails', async () => {
+    const binary = await fakeCodex({ settingsFailure: true });
+    const adapter = new CodexAdapter({ binary });
+    const events = await collect(adapter.run({
+      prompt: '第一轮',
+      cwd: '/tmp/project',
+      pendingModel: 'gpt-6-astra',
+      pendingEffort: 'ultra',
+    }).events);
+    expect(events).toContainEqual({
+      type: 'model_switch',
+      status: 'failed',
+      next: { model: 'gpt-6-astra', effort: 'ultra' },
+      message: 'settings update failed',
+    });
+    expect(events).toContainEqual({ type: 'error', message: 'settings update failed' });
+    const requests = await readRequests(binary);
+    expect(requests.some((request) => request.method === 'thread/start')).toBe(true);
+    expect(requests.some((request) => request.method === 'turn/start')).toBe(false);
+    await adapter.close();
+  });
+
+  it('runs the turn with the thread settings when the pending read-back fails', async () => {
+    const binary = await fakeCodex({ readFailure: true });
+    const adapter = new CodexAdapter({ binary });
+    const events = await collect(adapter.run({
+      prompt: '第一轮',
+      cwd: '/tmp/project',
+      pendingModel: 'gpt-6-astra',
+      pendingEffort: 'ultra',
+    }).events);
+    expect(events).toContainEqual(expect.objectContaining({
+      type: 'model_switch',
+      status: 'unconfirmed',
+      next: { model: 'gpt-6-astra', effort: 'ultra' },
+    }));
+    expect(events).toContainEqual({
+      type: 'ui_notice',
+      message: '模型设置已提交但未能确认，本轮先用线程当前设置执行；稍后重试。',
+      level: 'warning',
+    });
+    expect(events).toContainEqual({ type: 'text', delta: '完成' });
+    const requests = await readRequests(binary);
+    expect(requests.some((request) => request.method === 'turn/start')).toBe(true);
+    await adapter.close();
+  });
+
+  it('applies a pending choice to an existing thread after resuming it', async () => {
+    const binary = await fakeCodex();
+    const adapter = new CodexAdapter({ binary });
+    const events = await collect(adapter.run({
+      prompt: '继续',
+      sessionId: 'thread-cold',
+      cwd: '/tmp/project',
+      pendingModel: 'gpt-6-astra',
+      pendingEffort: 'ultra',
+    }).events);
+    expect(events).toContainEqual(expect.objectContaining({ type: 'model_switch', status: 'applied' }));
+    const requests = await readRequests(binary);
+    const methods = requests.map((request) => request.method);
+    expect(methods.indexOf('thread/resume')).toBeGreaterThan(-1);
+    expect(methods.indexOf('thread/resume')).toBeLessThan(methods.indexOf('model/list'));
+    expect(methods.indexOf('thread/settings/update')).toBeGreaterThan(methods.indexOf('model/list'));
+    expect(methods.indexOf('thread/settings/update')).toBeLessThan(methods.indexOf('turn/start'));
+    await adapter.close();
+  });
+
+  it('keeps a pending choice when an active writer blocks the resume', async () => {
+    const binary = await fakeCodex({ activeWriter: true });
+    const adapter = new CodexAdapter({ binary });
+    const events = await collect(adapter.run({
+      prompt: '继续',
+      sessionId: 'thread-desktop',
+      cwd: '/tmp/project',
+      pendingModel: 'gpt-6-astra',
+      pendingEffort: 'ultra',
+    }).events);
+    expect(events).toContainEqual({
+      type: 'model_switch',
+      status: 'active_writer',
+      next: { model: 'gpt-6-astra', effort: 'ultra' },
+      message: CODEX_ACTIVE_WRITER_MESSAGE,
+    });
+    expect(events).toContainEqual({ type: 'error', message: CODEX_ACTIVE_WRITER_MESSAGE });
+    const requests = await readRequests(binary);
+    expect(requests.some((request) => request.method === 'thread/settings/update')).toBe(false);
+    expect(requests.some((request) => request.method === 'turn/start')).toBe(false);
+    await adapter.close();
+  });
+
+  it('runs an existing thread when the pending settings write fails', async () => {
+    const binary = await fakeCodex({ settingsFailure: true });
+    const adapter = new CodexAdapter({ binary });
+    const events = await collect(adapter.run({
+      prompt: '继续',
+      sessionId: 'thread-existing',
+      cwd: '/tmp/project',
+      pendingModel: 'gpt-6-astra',
+      pendingEffort: 'ultra',
+    }).events);
+    expect(events).toContainEqual(expect.objectContaining({ type: 'model_switch', status: 'failed' }));
+    expect(events).toContainEqual({ type: 'ui_notice', message: 'settings update failed', level: 'warning' });
+    expect(events).toContainEqual({ type: 'text', delta: '完成' });
     await adapter.close();
   });
 

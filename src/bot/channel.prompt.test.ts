@@ -1,7 +1,13 @@
 import type { NormalizedMessage } from '@larksuiteoapi/node-sdk';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import type { LocalAttachment } from '../media/cache';
-import { buildPrompt, deriveThreadTitle, modelOverrideForBackend } from './channel';
+import {
+  buildPrompt,
+  deriveThreadTitle,
+  modelOverrideForBackend,
+  pendingOptionsForBackend,
+  settlePendingForModelSwitch,
+} from './channel';
 import type { AppConfig } from '../config/schema';
 import type { QuotedContext } from './quote';
 
@@ -63,6 +69,31 @@ describe('Codex prompt presentation', () => {
     const cfg = { preferences: { ompModel: 'omp-fast' } } as AppConfig;
     expect(modelOverrideForBackend(cfg, 'codex')).toEqual({});
     expect(modelOverrideForBackend(cfg, 'omp')).toEqual({ model: 'omp-fast' });
+  });
+
+  it('passes a pending Codex choice only to the Codex backend', () => {
+    const sessions = {
+      getPending: vi.fn().mockReturnValue({ model: 'gpt-6-astra', effort: 'ultra' }),
+    };
+    expect(pendingOptionsForBackend(sessions, 'chat:topic', 'codex')).toEqual({
+      pendingModel: 'gpt-6-astra',
+      pendingEffort: 'ultra',
+    });
+    expect(pendingOptionsForBackend(sessions, 'chat:topic', 'omp')).toEqual({});
+    sessions.getPending.mockReturnValue(undefined);
+    expect(pendingOptionsForBackend(sessions, 'chat:topic', 'codex')).toEqual({});
+  });
+
+  it('clears a pending choice only after applied or failed', () => {
+    const sessions = { clearPending: vi.fn() };
+    settlePendingForModelSwitch(sessions, 'chat:topic', 'active_writer');
+    settlePendingForModelSwitch(sessions, 'chat:topic', 'validation_failed');
+    settlePendingForModelSwitch(sessions, 'chat:topic', 'unconfirmed');
+    expect(sessions.clearPending).not.toHaveBeenCalled();
+    settlePendingForModelSwitch(sessions, 'chat:topic', 'applied');
+    expect(sessions.clearPending).toHaveBeenCalledWith('chat:topic');
+    settlePendingForModelSwitch(sessions, 'chat:topic', 'failed');
+    expect(sessions.clearPending).toHaveBeenCalledTimes(2);
   });
 
   it('uses an attachment title without exposing the internal file key', () => {

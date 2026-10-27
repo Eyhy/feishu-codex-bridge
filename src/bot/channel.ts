@@ -75,6 +75,26 @@ export function modelOverrideForBackend(cfg: AppConfig, backend: 'omp' | 'codex'
   return backend === 'omp' ? { model: getOmpModel(cfg) } : {};
 }
 
+/** Codex applies a pending model choice on the next run; OMP never reads it. */
+export function pendingOptionsForBackend(
+  sessions: Pick<SessionStore, 'getPending'>,
+  scope: string,
+  backend: 'omp' | 'codex',
+): { pendingModel?: string; pendingEffort?: string } {
+  if (backend !== 'codex') return {};
+  const pending = sessions.getPending(scope);
+  return pending ? { pendingModel: pending.model, pendingEffort: pending.effort } : {};
+}
+
+/** A pending choice survives failures that leave the thread untouched. */
+export function settlePendingForModelSwitch(
+  sessions: Pick<SessionStore, 'clearPending'>,
+  scope: string,
+  status: 'applied' | 'failed' | 'active_writer' | 'validation_failed' | 'unconfirmed',
+): void {
+  if (status === 'applied' || status === 'failed') sessions.clearPending(scope);
+}
+
 const DEBOUNCE_MS = 600;
 
 // Lark SDK logs API errors at error level even when the caller catches them.
@@ -768,6 +788,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
       sessionId: resumeFrom,
       cwd,
       ...modelOverrideForBackend(controls.cfg, backend),
+      ...pendingOptionsForBackend(sessions, scope, backend),
       imagePaths,
       stopGraceMs: getAgentStopGraceMs(controls.cfg),
       hostTools: feishuHost.tools,
@@ -1142,6 +1163,10 @@ async function processAgentStream(
           log.info('session', 'set', { sessionId: evt.sessionId });
         }
         state = reduce(state, evt);
+        continue;
+      }
+      if (evt.type === 'model_switch') {
+        settlePendingForModelSwitch(sessions, scope, evt.status);
         continue;
       }
       if (evt.type === 'usage') {

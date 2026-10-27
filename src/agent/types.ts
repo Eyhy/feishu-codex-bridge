@@ -103,6 +103,13 @@ export type AgentEvent =
   | { type: 'ui_title'; title: string }
   | { type: 'ui_editor_text'; text: string }
   | { type: 'ui_open_url'; url: string; instructions?: string }
+  | {
+      type: 'model_switch';
+      status: 'applied' | 'failed' | 'active_writer' | 'validation_failed' | 'unconfirmed';
+      previous?: { model: string | null; effort: string | null };
+      next?: ModelChoice;
+      message?: string;
+    }
   | { type: 'done'; sessionId?: string }
   | { type: 'error'; message: string };
 
@@ -169,6 +176,10 @@ export interface AgentRunOptions {
   cwd?: string;
   sessionId?: string;
   model?: string;
+  /** Model selected before this scope had a thread. Codex applies it to the
+   * thread it creates or resumes; OMP ignores it and uses `model` above. */
+  pendingModel?: string;
+  pendingEffort?: string;
   permissionMode?: 'default' | 'acceptEdits' | 'bypassPermissions' | 'plan';
   /** Local image paths to pass to agents that support native image flags. */
   imagePaths?: string[];

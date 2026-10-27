@@ -133,7 +133,30 @@ describe('project-first Feishu cards', () => {
     }));
     expect(card).toContain('模型：Astra · 强度：高');
     expect(card).toContain('切换模型');
+    expect(card).toContain('本话题：独立会话');
+    expect(card).not.toContain('chat:topic');
+    expect(card).not.toContain('范围：');
+    expect(card).not.toContain('话题独立 session');
+    for (const term of ['线程', '覆盖', 'Session']) expect(card).not.toContain(term);
   });
+
+  it.each(['p2p', 'group'] as const)(
+    'shows a %s scope as an independent session without the raw scope',
+    (chatMode) => {
+      const card = text(statusCard({
+        cwd: '/tmp/project',
+        sessionId: 'thread-1',
+        sessionStale: false,
+        agentName: 'Codex',
+        scope: 'chat-dm',
+        chatMode,
+      }));
+      expect(card).toContain('会话：独立');
+      expect(card).not.toContain('chat-dm');
+      expect(card).not.toContain('范围：');
+      for (const term of ['线程', '覆盖', 'Session']) expect(card).not.toContain(term);
+    },
+  );
 
   it('maps every documented reasoning effort to its Chinese label', () => {
     const labels: Record<string, string> = { low: '低', medium: '中', high: '高', xhigh: '极高', ultra: '最高' };
@@ -193,6 +216,10 @@ describe('project-first Feishu cards', () => {
   });
 
   it('lists the model command in help', () => {
-    expect(text(helpCard())).toContain('/model');
+    const card = text(helpCard());
+    expect(card).toContain('/projects');
+    expect(card).toContain('/model');
+    expect(card).toContain('切换本话题的模型与推理强度');
+    for (const term of ['线程', '覆盖', 'Session']) expect(card).not.toContain(term);
   });
 });

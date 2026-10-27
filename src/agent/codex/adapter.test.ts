@@ -867,7 +867,32 @@ describe('CodexAdapter', () => {
     }));
     expect(events).toContainEqual({
       type: 'ui_notice',
-      message: '模型设置已提交但未能确认，本轮先用线程当前设置执行；稍后重试。',
+      message: '模型设置已提交但未能确认，本轮先用会话当前设置执行；稍后重试。',
+      level: 'warning',
+    });
+    expect(events).toContainEqual({ type: 'text', delta: '完成' });
+    const requests = await readRequests(binary);
+    expect(requests.some((request) => request.method === 'turn/start')).toBe(true);
+    await adapter.close();
+  });
+
+  it('runs the turn with the thread settings when the pending read-back disagrees', async () => {
+    const binary = await fakeCodex({ ignoreSettings: true });
+    const adapter = new CodexAdapter({ binary });
+    const events = await collect(adapter.run({
+      prompt: '第一轮',
+      cwd: '/tmp/project',
+      pendingModel: 'gpt-6-astra',
+      pendingEffort: 'ultra',
+    }).events);
+    expect(events).toContainEqual(expect.objectContaining({
+      type: 'model_switch',
+      status: 'failed',
+      next: { model: 'gpt-6-astra', effort: 'ultra' },
+    }));
+    expect(events).toContainEqual({
+      type: 'ui_notice',
+      message: '模型设置已提交，但回读结果与选择不一致，本轮将使用会话当前设置。',
       level: 'warning',
     });
     expect(events).toContainEqual({ type: 'text', delta: '完成' });

@@ -952,7 +952,7 @@ export class CodexAdapter implements AgentAdapter {
               });
               queue.push({
                 type: 'ui_notice',
-                message: '模型设置已提交但未能确认，本轮先用线程当前设置执行；稍后重试。',
+                message: '模型设置已提交但未能确认，本轮先用会话当前设置执行；稍后重试。',
                 level: 'warning',
               });
             } else if (after.model !== pendingChoice.model || after.effort !== pendingChoice.effort) {
@@ -965,7 +965,7 @@ export class CodexAdapter implements AgentAdapter {
               });
               queue.push({
                 type: 'ui_notice',
-                message: '模型设置已提交，但回读结果与选择不一致，本轮将使用线程当前设置。',
+                message: '模型设置已提交，但回读结果与选择不一致，本轮将使用会话当前设置。',
                 level: 'warning',
               });
             } else {

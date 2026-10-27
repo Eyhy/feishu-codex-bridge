@@ -108,7 +108,7 @@ export interface CommandContext {
    */
   scope: string;
   /** Resolved chat mode for `msg.chatId`. Used by /status to surface the
-   * scope semantic to the user (`topic` shows "话题独立 session"). */
+   * scope semantic to the user (`topic` shows "本话题：独立会话"). */
   chatMode: 'p2p' | 'group' | 'topic';
   sessions: SessionStore;
   workspaces: WorkspaceStore;
@@ -860,7 +860,7 @@ async function handleCd(args: string, ctx: CommandContext): Promise<void> {
   ctx.activeRuns.interrupt(ctx.scope);
   ctx.workspaces.setCwd(ctx.scope, absolute);
   ctx.sessions.clear(ctx.scope);
-  await reply(ctx, `✓ 已切换 cwd 到 \`${absolute}\`\n（session 已重置）`);
+  await reply(ctx, `✓ 已切换 cwd 到 \`${absolute}\`\n（会话已重置）`);
 }
 
 async function handleWs(args: string, ctx: CommandContext): Promise<void> {
@@ -917,7 +917,7 @@ async function handleWsUse(name: string, ctx: CommandContext): Promise<void> {
   ctx.activeRuns.interrupt(ctx.scope);
   ctx.workspaces.setCwd(ctx.scope, cwd);
   ctx.sessions.clear(ctx.scope);
-  await reply(ctx, `✓ 已切换到 \`${name}\` (${cwd})\n（session 已重置）`);
+  await reply(ctx, `✓ 已切换到 \`${name}\` (${cwd})\n（会话已重置）`);
 }
 
 async function handleWsRemove(name: string, ctx: CommandContext): Promise<void> {
@@ -1376,14 +1376,14 @@ async function handleTimeout(args: string, ctx: CommandContext): Promise<void> {
   if (!trimmed) {
     const scopeMinutes = ctx.sessions.getIdleTimeoutMinutes(ctx.scope);
     const usage =
-      '\n\n用法:\n- `/timeout 15` 当前 session 设 15 分钟\n- `/timeout off` 当前 session 关闭探活\n- `/timeout default` 清除 session 覆盖,回退全局\n\n_注:`/new` 会清掉当前 session 的覆盖,回到全局_';
+      '\n\n用法:\n- `/timeout 15` 把本话题超时设为 15 分钟\n- `/timeout off` 关闭本话题探活\n- `/timeout default` 清除本话题的超时设置，回退全局\n\n_注：`/new` 会清掉本话题的超时设置，回到全局_';
     if (scopeMinutes !== undefined) {
       const effective =
-        scopeMinutes > 0 ? `${scopeMinutes} 分钟` : '已关闭（当前 session）';
-      await reply(ctx, `⏱ 当前 session 探活:${effective}\n全局默认:${formatGlobal()}${usage}`);
+        scopeMinutes > 0 ? `${scopeMinutes} 分钟` : '已关闭';
+      await reply(ctx, `⏱ 本话题超时设置：${effective}\n全局默认：${formatGlobal()}${usage}`);
       return;
     }
-    await reply(ctx, `⏱ 当前 session 探活:跟随全局(${formatGlobal()})${usage}`);
+    await reply(ctx, `⏱ 本话题超时设置：跟随全局（${formatGlobal()}）${usage}`);
     return;
   }
 
@@ -1393,8 +1393,8 @@ async function handleTimeout(args: string, ctx: CommandContext): Promise<void> {
     await reply(
       ctx,
       cleared
-        ? `✅ 已清除 session 覆盖,回退到全局(${formatGlobal()})。`
-        : `当前 session 本来就没设过覆盖,跟随全局(${formatGlobal()})。`,
+        ? `✅ 已清除本话题的超时设置，回退到全局（${formatGlobal()}）。`
+        : `本话题本来就没有单独设置，跟随全局（${formatGlobal()}）。`,
     );
     return;
   }
@@ -1402,7 +1402,7 @@ async function handleTimeout(args: string, ctx: CommandContext): Promise<void> {
   if (trimmed === 'off' || trimmed === '0') {
     ctx.sessions.setIdleTimeoutMinutes(ctx.scope, 0);
     log.info('command', 'timeout-off', { scope: ctx.scope });
-    await reply(ctx, '✅ 已关闭当前 session 的探活。');
+    await reply(ctx, '✅ 已关闭本话题的探活。');
     return;
   }
 
@@ -1413,7 +1413,7 @@ async function handleTimeout(args: string, ctx: CommandContext): Promise<void> {
   }
   ctx.sessions.setIdleTimeoutMinutes(ctx.scope, n);
   log.info('command', 'timeout-set', { scope: ctx.scope, minutes: n });
-  await reply(ctx, `✅ 当前 session 探活已设为 ${n} 分钟。`);
+  await reply(ctx, `✅ 已把本话题的超时设置为 ${n} 分钟。`);
 }
 
 async function handlePs(_args: string, ctx: CommandContext): Promise<void> {

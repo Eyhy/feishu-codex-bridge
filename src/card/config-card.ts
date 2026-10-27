@@ -88,7 +88,7 @@ export function configFormCard(opts: ConfigFormOpts): object {
               content:
                 '\n**run 探活(分钟)**\n' +
                 '_agent 长时间没输出时自动 kill,防止假死_\n' +
-                '_0 = 关闭(默认),范围 1-120。可被 `/timeout` 在单个 scope 覆盖_',
+                '_0 = 关闭(默认),范围 1-120。可被 `/timeout` 在本话题单独设置_',
             },
             {
               tag: 'input',

@@ -1,5 +1,5 @@
-import type { AgentAdapter, AgentAdditionalContext, AgentEvent, AgentRun, AgentRunOptions, AgentUiResponse, ListModelsOptions, ModelChoice, ModelOption, ModelSwitchResult, ThreadModelState } from '../types';
-import { ThreadModelReadError } from '../types';
+import type { AgentAdapter, AgentAdditionalContext, AgentEvent, AgentRun, AgentRunOptions, AgentUiResponse, ListModelsOptions, ModelChoice, ModelCopyResult, ModelOption, ModelSwitchResult, ThreadModelState } from '../types';
+import { FORK_MODEL_COPY_FAILED_MESSAGE, ThreadModelReadError } from '../types';
 import { log } from '../../core/logger';
 import { CodexAppServerClient, type JsonRpcNotification, type JsonRpcServerRequest } from './app-server';
 import type { SessionActivity, SessionDetail, SessionPage, SessionSummary } from '../../project/types';
@@ -267,6 +267,47 @@ export class CodexAdapter implements AgentAdapter {
         };
       }
       return { status: 'applied', previous, next: choice };
+    } finally {
+      this.endOperation();
+    }
+  }
+
+  async copyThreadModel(sourceThreadId: string, targetThreadId: string): Promise<ModelCopyResult> {
+    this.beginOperation();
+    const failed = (step: string, details: Record<string, unknown> = {}): ModelCopyResult => {
+      log.warn('codex', step, { sourceThreadId, targetThreadId, ...details });
+      return { status: 'failed', message: FORK_MODEL_COPY_FAILED_MESSAGE };
+    };
+    try {
+      let source: ThreadModelState;
+      try {
+        source = await this.readThreadModel(sourceThreadId);
+      } catch (err) {
+        return failed('copy-model-source-read-failed', { error: errorMessage(err) });
+      }
+      if (!source.model || !source.effort) return { status: 'skipped' };
+      try {
+        await this.client.request('thread/settings/update', {
+          threadId: targetThreadId,
+          model: source.model,
+          effort: source.effort,
+        });
+      } catch (err) {
+        return failed('copy-model-target-write-failed', { error: errorMessage(err) });
+      }
+      let after: ThreadModelState;
+      try {
+        after = await this.readThreadModel(targetThreadId);
+      } catch (err) {
+        return failed('copy-model-target-read-failed', { error: errorMessage(err) });
+      }
+      if (after.model !== source.model || after.effort !== source.effort) {
+        return failed('copy-model-read-back-mismatch', {
+          expected: { model: source.model, effort: source.effort },
+          actual: { model: after.model, effort: after.effort },
+        });
+      }
+      return { status: 'applied' };
     } finally {
       this.endOperation();
     }

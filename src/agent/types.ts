@@ -156,6 +156,18 @@ export interface ModelSwitchResult {
   message?: string;
 }
 
+/**
+ * Result of copying a source thread's model settings onto an already forked
+ * thread. A fork itself does not inherit model or effort, so this is a
+ * separate, best-effort step that never deletes the fork when it fails.
+ */
+export type ModelCopyResult =
+  | { status: 'applied' | 'skipped' }
+  | { status: 'failed'; message: string };
+
+/** Fixed user-facing copy when a fork keeps existing but its model copy fails. */
+export const FORK_MODEL_COPY_FAILED_MESSAGE = '模型未继承，可在新话题用 /model 重选';
+
 /** Distinguishes an unreadable thread from one that no longer exists. */
 export class ThreadModelReadError extends Error {
   readonly code: 'not_found' | 'read_failed';
@@ -238,6 +250,8 @@ export interface AgentAdapter {
   listModels?(opts?: ListModelsOptions): Promise<ModelOption[]>;
   /** Persist a thread's model + effort and confirm it with a read-back. */
   switchThreadModel?(threadId: string, choice: ModelChoice): Promise<ModelSwitchResult>;
+  /** Copy a source thread's persisted model + effort onto an existing fork. */
+  copyThreadModel?(sourceThreadId: string, targetThreadId: string): Promise<ModelCopyResult>;
   createSession?(cwd: string): Promise<import('../project/types').SessionSummary>;
   renameSession?(threadId: string, title: string): Promise<void>;
   archiveSession?(threadId: string): Promise<void>;

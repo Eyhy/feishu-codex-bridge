@@ -2,6 +2,7 @@ import { stat } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import type { LarkChannel, NormalizedMessage } from '@larksuiteoapi/node-sdk';
 import type { AgentAdapter, ModelOption, ModelSwitchResult, ThreadModelState } from '../agent/types';
+import { FORK_MODEL_COPY_FAILED_MESSAGE } from '../agent/types';
 import { releaseWriterIfAllIdle } from '../bot/active-runs';
 import type { ActiveRuns } from '../bot/active-runs';
 import {
@@ -692,20 +693,35 @@ async function handleSession(args: string, ctx: CommandContext): Promise<void> {
     ]);
     return;
   } else if (action === 'fork' || action.startsWith('fork ')) {
-    const sourceThreadId = action.slice(4).trim() || currentTopicThreadId(ctx);
-    if (!sourceThreadId) return reply(ctx, '请在已连接的 Codex 话题中创建分支会话。');
-    if (!ctx.agent.forkSession) return reply(ctx, '当前 Codex 版本不支持分支会话。');
-    let forked: import('../project/types').SessionSummary;
     try {
-      forked = await ctx.agent.forkSession(sourceThreadId, project.cwd);
-    } catch (err) {
-      await commandFeedback(ctx, '分支会话创建失败', operationError(err), []);
+      const sourceThreadId = action.slice(4).trim() || currentTopicThreadId(ctx);
+      if (!sourceThreadId) return reply(ctx, '请在已连接的 Codex 话题中创建分支会话。');
+      if (!ctx.agent.forkSession) return reply(ctx, '当前 Codex 版本不支持分支会话。');
+      let forked: import('../project/types').SessionSummary;
+      try {
+        forked = await ctx.agent.forkSession(sourceThreadId, project.cwd);
+      } catch (err) {
+        await commandFeedback(ctx, '分支会话创建失败', operationError(err), []);
+        return;
+      }
+      let copyMessage: string | undefined;
+      if (ctx.agent.copyThreadModel) {
+        try {
+          const copied = await ctx.agent.copyThreadModel(sourceThreadId, forked.threadId);
+          if (copied.status === 'failed') copyMessage = FORK_MODEL_COPY_FAILED_MESSAGE;
+        } catch (err) {
+          log.warn('command', 'fork-model-copy-failed', { error: operationError(err) });
+          copyMessage = FORK_MODEL_COPY_FAILED_MESSAGE;
+        }
+      }
+      const source = (await ctx.agent.listSessions(project.cwd)).find((session) => session.threadId === sourceThreadId);
+      const forkTitle = forked.name?.trim() || `${source?.name?.trim() || '当前会话'} · 分支`;
+      await createSessionTopic(ctx, project, forked.threadId, forkTitle);
+      if (copyMessage) await reply(ctx, copyMessage);
       return;
+    } finally {
+      await releaseWriterIfAllIdle(ctx.activeRuns, ctx.agent);
     }
-    const source = (await ctx.agent.listSessions(project.cwd)).find((session) => session.threadId === sourceThreadId);
-    const forkTitle = forked.name?.trim() || `${source?.name?.trim() || '当前会话'} · 分支`;
-    await createSessionTopic(ctx, project, forked.threadId, forkTitle);
-    return;
   } else {
     return handleSessions('', ctx);
   }

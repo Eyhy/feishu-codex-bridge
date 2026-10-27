@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { CODEX_ACTIVE_WRITER_MESSAGE, CodexAdapter } from './adapter';
-import { ThreadModelReadError } from '../types';
+import { FORK_MODEL_COPY_FAILED_MESSAGE, ThreadModelReadError } from '../types';
 import type { AgentEvent } from '../types';
 
 async function fakeCodex(options: { rejectDesktopMetadata?: boolean; rejectAdditionalContext?: boolean; interaction?: 'questions' | 'approval'; activeWriter?: boolean; ignoreSettings?: boolean; modelListFailure?: 'throw' | 'empty'; modelListMissingOnce?: boolean; modelListSecondFailure?: 'throw' | 'empty'; settingsFailure?: boolean; readFailure?: boolean; resumeSettings?: { model: string | null; effort: string | null } } = {}): Promise<string> {
@@ -31,6 +31,8 @@ const readFailure = ${JSON.stringify(Boolean(options.readFailure))};
 const threadSettings = new Map([
   ['thread-existing', { model: 'gpt-5.6-sol', effort: 'high' }],
   ['thread-cold', { model: 'gpt-5.6-sol', effort: 'high' }],
+  ['thread-empty', { model: null, effort: null }],
+  ['thread-model-only', { model: 'gpt-5.6-sol', effort: null }],
 ]);
 const loadedThreads = new Set(['thread-existing']);
 for (const signal of ['SIGTERM', 'SIGINT']) process.on(signal, () => { appendFileSync(requestLog, JSON.stringify({ event: 'app-server-exit', signal }) + '\\n'); process.exit(0); });
@@ -136,7 +138,11 @@ for await (const line of rl) {
   if (msg.method === 'turn/interrupt') send({ id: msg.id, result: {} });
   if (msg.method === 'thread/archive') send({ id: msg.id, result: {} });
   if (msg.method === 'thread/unarchive') send({ id: msg.id, result: { thread: { id: msg.params.threadId, name: '已恢复', preview: '恢复成功', cwd: '/tmp/project', updatedAt: 40, status: { type: 'idle' } } } });
-  if (msg.method === 'thread/fork') send({ id: msg.id, result: { thread: { id: 'thread-fork', name: '分支会话', preview: '分支', cwd: msg.params.cwd, updatedAt: 50, status: { type: 'idle' }, forkedFromId: msg.params.threadId } } });
+  if (msg.method === 'thread/fork') {
+    threadSettings.set('thread-fork', { model: 'gpt-6-astra', effort: 'medium' });
+    loadedThreads.add('thread-fork');
+    send({ id: msg.id, result: { thread: { id: 'thread-fork', name: '分支会话', preview: '分支', cwd: msg.params.cwd, updatedAt: 50, status: { type: 'idle' }, forkedFromId: msg.params.threadId } } });
+  }
   if (msg.method === 'thread/compact/start' || msg.method === 'review/start') send({ id: msg.id, result: {} });
   if (!msg.method && msg.id === 500) {
     const valid = msg.result?.answers?.environment?.answers?.[0] === '测试' && msg.result?.answers?.note?.answers?.[0] === '继续';
@@ -205,6 +211,63 @@ describe('CodexAdapter', () => {
     });
     await expect(adapter.compactSession?.('thread-existing')).resolves.toBeUndefined();
     await expect(adapter.reviewSession?.('thread-existing')).resolves.toBeUndefined();
+    await adapter.close();
+  });
+
+  it('copies the source thread model and effort onto a forked thread', async () => {
+    const binary = await fakeCodex();
+    const adapter = new CodexAdapter({ binary });
+    const forked = await adapter.forkSession?.('thread-existing', '/tmp/project');
+    const result = await adapter.copyThreadModel?.('thread-existing', forked!.threadId);
+    expect(result).toMatchObject({ status: 'applied' });
+    const requests = (await readRequests(binary)).filter((request) =>
+      request.method === 'thread/fork' || request.method === 'thread/read' || request.method === 'thread/settings/update',
+    );
+    expect(requests.map((request) => request.method)).toEqual([
+      'thread/fork',
+      'thread/read',
+      'thread/settings/update',
+      'thread/read',
+    ]);
+    expect(requests[1]!.params).toEqual({ threadId: 'thread-existing' });
+    expect(requests[2]!.params).toEqual({ threadId: 'thread-fork', model: 'gpt-5.6-sol', effort: 'high' });
+    const allRequests = await readRequests(binary);
+    expect(allRequests.some((request) => request.method === 'thread/resume')).toBe(false);
+    expect(requests.some((request) => request.method === 'thread/delete')).toBe(false);
+    await adapter.close();
+  });
+
+  it('does not write settings when the source thread has no model', async () => {
+    const binary = await fakeCodex();
+    const adapter = new CodexAdapter({ binary });
+    const forked = await adapter.forkSession?.('thread-existing', '/tmp/project');
+    const result = await adapter.copyThreadModel?.('thread-empty', forked!.threadId);
+    expect(result).toMatchObject({ status: 'skipped' });
+    const requests = await readRequests(binary);
+    expect(requests.some((request) => request.method === 'thread/settings/update')).toBe(false);
+    await adapter.close();
+  });
+
+  it('skips a source that has a model but no effort', async () => {
+    const binary = await fakeCodex();
+    const adapter = new CodexAdapter({ binary });
+    const forked = await adapter.forkSession?.('thread-existing', '/tmp/project');
+    const result = await adapter.copyThreadModel?.('thread-model-only', forked!.threadId);
+    expect(result).toMatchObject({ status: 'skipped' });
+    const requests = await readRequests(binary);
+    expect(requests.some((request) => request.method === 'thread/settings/update')).toBe(false);
+    await adapter.close();
+  });
+
+  it('keeps the fork when copying its model fails', async () => {
+    const binary = await fakeCodex({ ignoreSettings: true });
+    const adapter = new CodexAdapter({ binary });
+    const forked = await adapter.forkSession?.('thread-existing', '/tmp/project');
+    const result = await adapter.copyThreadModel?.('thread-existing', forked!.threadId);
+    expect(result).toMatchObject({ status: 'failed', message: FORK_MODEL_COPY_FAILED_MESSAGE });
+    const requests = await readRequests(binary);
+    expect(requests.filter((request) => request.method === 'thread/fork')).toHaveLength(1);
+    expect(requests.some((request) => request.method === 'thread/delete')).toBe(false);
     await adapter.close();
   });
 

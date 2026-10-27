@@ -50,7 +50,7 @@ import type { TaskRecord, TaskStatus } from '../task/types';
 import type { WorkspaceStore } from '../workspace/store';
 import type { ProjectCatalog } from '../project/catalog';
 import type { Project, ProjectBindingStore } from '../project/types';
-import { ActiveRuns, type RunHandle } from './active-runs';
+import { ActiveRuns, releaseWriterIfAllIdle, type RunHandle } from './active-runs';
 import { ChatModeCache, type ChatMode } from './chat-mode-cache';
 import { handleCommentMention } from './comments';
 import { createFeishuHostIntegration } from './feishu-host';
@@ -987,6 +987,9 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     if (reactionId) {
       await removeReaction(channel, lastMsg.messageId, reactionId);
     }
+    // Releasing here keeps a successful turn successful even if the writer
+    // release fails; the helper logs and swallows that failure.
+    await releaseWriterIfAllIdle(activeRuns, agent);
   }
 }
 

@@ -214,6 +214,8 @@ export interface AgentAdapter {
   forkSession?(threadId: string, cwd?: string): Promise<import('../project/types').SessionSummary>;
   compactSession?(threadId: string): Promise<void>;
   reviewSession?(threadId: string): Promise<void>;
+  /** Release a thread writer after a short idle grace, if supported. */
+  releaseWriterIfIdle?(): Promise<void>;
   /** Close shared adapter resources such as a long-lived app-server child. */
   close?(): Promise<void>;
 }

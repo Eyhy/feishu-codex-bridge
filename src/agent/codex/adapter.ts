@@ -53,6 +53,9 @@ interface ThreadResponse {
 }
 
 const BRIDGE_SERVICE_NAME = 'feishu_codex_bridge';
+const WRITER_RELEASE_GRACE_MS = 1_000;
+
+export const CODEX_ACTIVE_WRITER_MESSAGE = '桌面端正在使用这个会话，请在桌面端关闭该会话后重试';
 
 export class CodexAdapter implements AgentAdapter {
   readonly id = 'codex';
@@ -60,6 +63,11 @@ export class CodexAdapter implements AgentAdapter {
   private readonly client: CodexAppServerClient;
   private modelCache?: { models: ModelOption[]; expiresAt: number };
   private modelCachePromise?: Promise<ModelOption[]>;
+  private activeOperations = 0;
+  private releaseTimer?: NodeJS.Timeout;
+  private releaseResolve?: () => void;
+  private releasePromise?: Promise<void>;
+  private releaseRequested = false;
 
   constructor(opts: CodexAdapterOptions = {}) {
     this.client = new CodexAppServerClient(opts.binary);
@@ -70,7 +78,74 @@ export class CodexAdapter implements AgentAdapter {
   }
 
   async close(): Promise<void> {
+    this.releaseRequested = false;
+    this.cancelPendingRelease();
     await this.client.close();
+  }
+
+  /**
+   * Give a completed turn/model operation a short grace period, then close the
+   * app-server so another Codex process can take the thread writer. A new
+   * operation during the grace cancels the timer but keeps the release intent,
+   * which is rescheduled once that operation finishes. The next request after
+   * a release restarts the app-server through ensureStarted().
+   */
+  releaseWriterIfIdle(): Promise<void> {
+    this.releaseRequested = true;
+    return this.ensureReleaseScheduled();
+  }
+
+  private ensureReleaseScheduled(): Promise<void> {
+    if (!this.releaseRequested) return Promise.resolve();
+    if (this.releasePromise) return this.releasePromise;
+    this.releasePromise = new Promise<void>((resolve) => {
+      this.releaseResolve = resolve;
+      this.releaseTimer = setTimeout(() => {
+        this.releaseTimer = undefined;
+        if (this.activeOperations > 0) {
+          this.finishRelease();
+          return;
+        }
+        this.releaseRequested = false;
+        void this.client.close()
+          .catch((err) => {
+            log.warn('codex', 'writer-release-failed', {
+              error: err instanceof Error ? err.message : String(err),
+            });
+          })
+          .finally(() => this.finishRelease());
+      }, WRITER_RELEASE_GRACE_MS);
+    });
+    return this.releasePromise;
+  }
+
+  private beginOperation(): void {
+    this.activeOperations += 1;
+    // A new operation takes priority over a pending release, but the release
+    // intent survives so the writer is freed once this operation finishes.
+    if (this.releaseTimer) clearTimeout(this.releaseTimer);
+    this.releaseTimer = undefined;
+    this.finishRelease();
+  }
+
+  private endOperation(): void {
+    this.activeOperations = Math.max(0, this.activeOperations - 1);
+    if (this.activeOperations === 0 && this.releaseRequested) {
+      void this.ensureReleaseScheduled();
+    }
+  }
+
+  private cancelPendingRelease(): void {
+    if (this.releaseTimer) clearTimeout(this.releaseTimer);
+    this.releaseTimer = undefined;
+    this.finishRelease();
+  }
+
+  private finishRelease(): void {
+    const resolve = this.releaseResolve;
+    this.releaseResolve = undefined;
+    this.releasePromise = undefined;
+    resolve?.();
   }
 
   async listModels(opts: ListModelsOptions = {}): Promise<ModelOption[]> {
@@ -90,40 +165,50 @@ export class CodexAdapter implements AgentAdapter {
   }
 
   private async fetchModels(): Promise<ModelOption[]> {
-    const models: ModelOption[] = [];
-    let cursor: string | undefined;
-    do {
-      const response = await this.client.request<{
-        data?: Array<Record<string, unknown>>;
-        nextCursor?: string | null;
-      }>('model/list', {
-        includeHidden: true,
-        ...(cursor ? { cursor } : {}),
-      });
-      for (const entry of response.data ?? []) {
-        const mapped = mapModel(entry);
-        if (mapped) models.push(mapped);
-      }
-      cursor = response.nextCursor ?? undefined;
-    } while (cursor);
-    return models;
+    this.beginOperation();
+    try {
+      const models: ModelOption[] = [];
+      let cursor: string | undefined;
+      do {
+        const response = await this.client.request<{
+          data?: Array<Record<string, unknown>>;
+          nextCursor?: string | null;
+        }>('model/list', {
+          includeHidden: true,
+          ...(cursor ? { cursor } : {}),
+        });
+        for (const entry of response.data ?? []) {
+          const mapped = mapModel(entry);
+          if (mapped) models.push(mapped);
+        }
+        cursor = response.nextCursor ?? undefined;
+      } while (cursor);
+      return models;
+    } finally {
+      this.endOperation();
+    }
   }
 
   async readThreadModel(threadId: string): Promise<ThreadModelState> {
-    let response: { thread?: Record<string, unknown> };
+    this.beginOperation();
     try {
-      response = await this.client.request('thread/read', { threadId });
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      if (isThreadNotFoundError(err)) throw new ThreadModelReadError('not_found', message);
-      throw new ThreadModelReadError('read_failed', message);
+      let response: { thread?: Record<string, unknown> };
+      try {
+        response = await this.client.request('thread/read', { threadId });
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        if (isThreadNotFoundError(err)) throw new ThreadModelReadError('not_found', message);
+        throw new ThreadModelReadError('read_failed', message);
+      }
+      const thread = response.thread;
+      if (!thread) throw new ThreadModelReadError('read_failed', 'Codex app-server did not return the thread');
+      const model = typeof thread.model === 'string' && thread.model.trim() ? thread.model.trim() : null;
+      const effort = typeof thread.reasoningEffort === 'string' && thread.reasoningEffort.trim() ? thread.reasoningEffort.trim() : null;
+      const canAcceptDirectInput = typeof thread.canAcceptDirectInput === 'boolean' ? thread.canAcceptDirectInput : null;
+      return { model, effort, canAcceptDirectInput, loaded: canAcceptDirectInput !== null };
+    } finally {
+      this.endOperation();
     }
-    const thread = response.thread;
-    if (!thread) throw new ThreadModelReadError('read_failed', 'Codex app-server did not return the thread');
-    const model = typeof thread.model === 'string' && thread.model.trim() ? thread.model.trim() : null;
-    const effort = typeof thread.reasoningEffort === 'string' && thread.reasoningEffort.trim() ? thread.reasoningEffort.trim() : null;
-    const canAcceptDirectInput = typeof thread.canAcceptDirectInput === 'boolean' ? thread.canAcceptDirectInput : null;
-    return { model, effort, canAcceptDirectInput, loaded: canAcceptDirectInput !== null };
   }
 
   async listSessions(cwd: string): Promise<SessionSummary[]> {
@@ -322,6 +407,7 @@ export class CodexAdapter implements AgentAdapter {
   }
 
   run(opts: AgentRunOptions): AgentRun {
+    this.beginOperation();
     const client = this.client;
     const requestTurn = this.requestTurn.bind(this);
     const queue = new AsyncQueue<AgentEvent>();
@@ -339,6 +425,7 @@ export class CodexAdapter implements AgentAdapter {
     const finish = (): void => {
       if (settled) return;
       settled = true;
+      this.endOperation();
       unsubscribe?.();
       unsubscribeRequests?.();
       queue.close();
@@ -610,7 +697,14 @@ export class CodexAdapter implements AgentAdapter {
         });
         turnId = turn.turn?.id ?? turn.id;
       } catch (err) {
-        if (!stopped) queue.push({ type: 'error', message: err instanceof Error ? err.message : String(err) });
+        if (!stopped) {
+          queue.push({
+            type: 'error',
+            message: isActiveWriterError(err)
+              ? CODEX_ACTIVE_WRITER_MESSAGE
+              : err instanceof Error ? err.message : String(err),
+          });
+        }
         finish();
       }
     };
@@ -705,6 +799,11 @@ function isAdditionalContextCompatibilityError(err: unknown): boolean {
   const message = err instanceof Error ? err.message : String(err);
   return /additionalContext|additional_context/i.test(message)
     && /unknown|unexpected|unsupported|invalid params?/i.test(message);
+}
+
+function isActiveWriterError(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err);
+  return /already has an active writer/i.test(message);
 }
 
 function isThreadNotLoadedError(err: unknown): boolean {

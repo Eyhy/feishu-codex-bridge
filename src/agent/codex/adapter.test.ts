@@ -2,11 +2,11 @@ import { chmod, mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { CodexAdapter } from './adapter';
+import { CODEX_ACTIVE_WRITER_MESSAGE, CodexAdapter } from './adapter';
 import { ThreadModelReadError } from '../types';
 import type { AgentEvent } from '../types';
 
-async function fakeCodex(options: { rejectDesktopMetadata?: boolean; rejectAdditionalContext?: boolean; interaction?: 'questions' | 'approval' } = {}): Promise<string> {
+async function fakeCodex(options: { rejectDesktopMetadata?: boolean; rejectAdditionalContext?: boolean; interaction?: 'questions' | 'approval'; activeWriter?: boolean } = {}): Promise<string> {
   const dir = await mkdtemp(join(tmpdir(), 'codex-adapter-test-'));
   const path = join(dir, 'codex-fake.mjs');
   await writeFile(path, `#!/usr/bin/env node
@@ -19,6 +19,8 @@ const requestLog = ${JSON.stringify(join(dir, 'requests.jsonl'))};
 const rejectDesktopMetadata = ${JSON.stringify(Boolean(options.rejectDesktopMetadata))};
 const rejectAdditionalContext = ${JSON.stringify(Boolean(options.rejectAdditionalContext))};
 const interaction = ${JSON.stringify(options.interaction ?? '')};
+const activeWriter = ${JSON.stringify(Boolean(options.activeWriter))};
+for (const signal of ['SIGTERM', 'SIGINT']) process.on(signal, () => { appendFileSync(requestLog, JSON.stringify({ event: 'app-server-exit', signal }) + '\\n'); process.exit(0); });
 let activeThreadId = 'thread-new';
 let activeThreadName = '';
 for await (const line of rl) {
@@ -46,6 +48,7 @@ for await (const line of rl) {
   }
   if (msg.method === 'thread/resume') {
     if (msg.params.threadId === 'missing-rollout') send({ id: msg.id, error: { code: -32000, message: 'no rollout found for thread id missing-rollout' } });
+    else if (activeWriter) send({ id: msg.id, error: { code: -32000, message: 'thread ' + msg.params.threadId + ' already has an active writer' } });
     else if (msg.params.threadId === 'unloaded') send({ id: msg.id, result: { thread: { id: 'unloaded', sessionId: 'session-2', name: '恢复会话', preview: '恢复详情', cwd: '/tmp/project', updatedAt: 30, status: { type: 'idle' }, source: 'vscode', turns: [{ items: [{ type: 'agentMessage', text: '已恢复' }] }] } } });
     else { activeThreadId = msg.params.threadId; send({ id: msg.id, result: { thread: { id: msg.params.threadId, cwd: '/tmp/project' } } }); }
   }
@@ -106,9 +109,15 @@ for await (const line of rl) {
   return path;
 }
 
-async function readRequests(binary: string): Promise<Array<{ method: string; params?: Record<string, unknown> }>> {
+async function readLog(binary: string): Promise<Array<Record<string, unknown>>> {
   const text = await readFile(join(dirname(binary), 'requests.jsonl'), 'utf8');
-  return text.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
+  return text.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line) as Record<string, unknown>);
+}
+
+async function readRequests(binary: string): Promise<Array<{ method: string; params?: Record<string, unknown> }>> {
+  return (await readLog(binary)).filter(
+    (entry): entry is { method: string; params?: Record<string, unknown> } => typeof entry.method === 'string',
+  );
 }
 
 async function collect(events: AsyncIterable<AgentEvent>): Promise<AgentEvent[]> {
@@ -378,6 +387,47 @@ describe('CodexAdapter', () => {
     await expect(adapter.listModels({ includeHidden: true })).resolves.toEqual(
       expect.arrayContaining([expect.objectContaining({ model: 'hidden-model', hidden: true })]),
     );
+    await adapter.close();
+  });
+
+  it('reports an active writer without creating or forking a thread', async () => {
+    const binary = await fakeCodex({ activeWriter: true });
+    const adapter = new CodexAdapter({ binary });
+    const events = await collect(adapter.run({
+      prompt: '继续处理',
+      sessionId: 'thread-desktop',
+      cwd: '/tmp/project',
+    }).events);
+    expect(events).toContainEqual({ type: 'error', message: CODEX_ACTIVE_WRITER_MESSAGE });
+    const requests = await readRequests(binary);
+    expect(requests.filter((request) => request.method === 'thread/resume')).toHaveLength(1);
+    expect(requests.some((request) => request.method === 'thread/start')).toBe(false);
+    expect(requests.some((request) => request.method === 'thread/fork')).toBe(false);
+    await adapter.close();
+  });
+
+  it('releases the app-server after the idle grace period', async () => {
+    const binary = await fakeCodex();
+    const adapter = new CodexAdapter({ binary });
+    await collect(adapter.run({ prompt: '跑完', cwd: '/tmp/project' }).events);
+    const startedAt = Date.now();
+    await adapter.releaseWriterIfIdle();
+    expect(Date.now() - startedAt).toBeGreaterThanOrEqual(900);
+    const log = await readLog(binary);
+    expect(log.filter((entry) => entry.event === 'app-server-exit')).toHaveLength(1);
+  });
+
+  it('cancels a pending release when a new run starts', async () => {
+    const binary = await fakeCodex();
+    const adapter = new CodexAdapter({ binary });
+    await collect(adapter.run({ prompt: '第一轮', cwd: '/tmp/project' }).events);
+    const release = adapter.releaseWriterIfIdle();
+    const second = adapter.run({ prompt: '第二轮', cwd: '/tmp/project' });
+    await release;
+    await collect(second.events);
+    expect((await readLog(binary)).filter((entry) => entry.event === 'app-server-exit')).toHaveLength(0);
+    await adapter.releaseWriterIfIdle();
+    expect((await readLog(binary)).filter((entry) => entry.event === 'app-server-exit')).toHaveLength(1);
     await adapter.close();
   });
 });

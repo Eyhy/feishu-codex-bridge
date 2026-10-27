@@ -1,4 +1,5 @@
-import type { AgentAdditionalContext, AgentRun, AgentUiResponse } from '../agent/types';
+import type { AgentAdditionalContext, AgentAdapter, AgentRun, AgentUiResponse } from '../agent/types';
+import { log } from '../core/logger';
 
 export interface RunHandle {
   run: AgentRun;
@@ -23,6 +24,11 @@ export class ActiveRuns {
 
   has(chatId: string): boolean {
     return this.handles.has(chatId);
+  }
+
+  /** True when no scope has an active run, approval, or pending input. */
+  allIdle(): boolean {
+    return this.handles.size === 0;
   }
 
   /**
@@ -65,5 +71,24 @@ export class ActiveRuns {
     this.handles.clear();
     for (const h of all) h.interrupted = true;
     await Promise.allSettled(all.map((h) => h.run.stop()));
+  }
+}
+
+/**
+ * Release the shared Codex writer only once every scope is idle. Runs share one
+ * app-server, so releasing while another topic is still executing would pull
+ * the process out from under it.
+ */
+export async function releaseWriterIfAllIdle(
+  activeRuns: ActiveRuns,
+  agent: Pick<AgentAdapter, 'releaseWriterIfIdle'>,
+): Promise<void> {
+  if (!activeRuns.allIdle()) return;
+  try {
+    await agent.releaseWriterIfIdle?.();
+  } catch (err) {
+    log.warn('agent', 'writer-release-failed', {
+      error: err instanceof Error ? err.message : String(err),
+    });
   }
 }

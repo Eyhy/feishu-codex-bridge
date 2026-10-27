@@ -131,6 +131,24 @@ export interface ListModelsOptions {
   forceRefresh?: boolean;
 }
 
+/** The model + reasoning effort pair a user picked for a thread. */
+export interface ModelChoice {
+  model: string;
+  effort: string;
+}
+
+/**
+ * Result of writing a thread's persisted settings. `applied` is only reported
+ * after a read-back confirms both values; `unconfirmed` means the write was
+ * accepted but the read-back failed.
+ */
+export interface ModelSwitchResult {
+  status: 'applied' | 'failed' | 'active_writer' | 'unconfirmed';
+  previous?: { model: string | null; effort: string | null };
+  next?: ModelChoice;
+  message?: string;
+}
+
 /** Distinguishes an unreadable thread from one that no longer exists. */
 export class ThreadModelReadError extends Error {
   readonly code: 'not_found' | 'read_failed';
@@ -207,6 +225,8 @@ export interface AgentAdapter {
   readThreadModel?(threadId: string): Promise<ThreadModelState>;
   /** List the models this agent can use. */
   listModels?(opts?: ListModelsOptions): Promise<ModelOption[]>;
+  /** Persist a thread's model + effort and confirm it with a read-back. */
+  switchThreadModel?(threadId: string, choice: ModelChoice): Promise<ModelSwitchResult>;
   createSession?(cwd: string): Promise<import('../project/types').SessionSummary>;
   renameSession?(threadId: string, title: string): Promise<void>;
   archiveSession?(threadId: string): Promise<void>;

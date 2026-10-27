@@ -441,7 +441,7 @@ export interface StatusModelInfo {
   pendingDisplayName?: string;
 }
 
-function effortLabel(effort: string): string {
+export function effortLabel(effort: string): string {
   switch (effort) {
     case 'low': return '低';
     case 'medium': return '中';
@@ -474,6 +474,9 @@ export function statusCard(info: StatusInfo): object {
   const refreshAction = info.model?.readFailed
     ? [{ text: '刷新', value: { cmd: 'status' } }]
     : [];
+  const modelAction = info.model
+    ? [{ text: '切换模型', value: { cmd: 'model' } }]
+    : [];
   if (info.hideInternalIds) {
     return shell('当前状态', [
       divMd([
@@ -486,6 +489,7 @@ export function statusCard(info: StatusInfo): object {
       HR,
       actions([
         { text: '查看会话', value: { cmd: 'sessions' }, style: 'primary' },
+        ...modelAction,
         ...refreshAction,
         { text: '使用帮助', value: { cmd: 'help' } },
       ]),
@@ -512,6 +516,7 @@ export function statusCard(info: StatusInfo): object {
     HR,
     actions([
       { text: '新会话', value: { cmd: 'new' }, style: 'primary' },
+      ...modelAction,
       ...refreshAction,
       { text: '工作空间', value: { cmd: 'ws.list' } },
       { text: '使用帮助', value: { cmd: 'help' } },
@@ -533,6 +538,7 @@ export function helpCard(): object {
         '',
         '**高级入口**',
         '也可以发送 `/projects`、`/sessions`、`/status`、`/stop`、`/new`。',
+        '发送 `/model` 可以切换本话题的模型与推理强度。',
       ].join('\n'),
     ),
     HR,

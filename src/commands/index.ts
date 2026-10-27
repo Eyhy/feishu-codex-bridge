@@ -1,7 +1,8 @@
 import { stat } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import type { LarkChannel, NormalizedMessage } from '@larksuiteoapi/node-sdk';
-import type { AgentAdapter } from '../agent/types';
+import type { AgentAdapter, ModelOption, ModelSwitchResult, ThreadModelState } from '../agent/types';
+import { releaseWriterIfAllIdle } from '../bot/active-runs';
 import type { ActiveRuns } from '../bot/active-runs';
 import {
   accountCurrentCard,
@@ -10,8 +11,17 @@ import {
   accountSuccessCard,
 } from '../card/account-cards';
 import { configCancelledCard, configFormCard, configSavedCard } from '../card/config-card';
+import {
+  MODEL_DEFAULT_EFFORT,
+  effortSelectCard,
+  modelErrorCard,
+  modelNoticeCard,
+  modelSelectCard,
+  modelSwitchSuccessCard,
+} from '../card/model-cards';
 import { forgetManagedCard, sendManagedCard, updateManagedCard } from '../card/managed';
 import {
+  effortLabel,
   helpCard,
   projectFeedbackCard,
   projectWelcomeCard,
@@ -31,6 +41,7 @@ import {
 import type { StatusModelInfo } from '../card/templates';
 import type { AppConfig, MessageReplyMode, TenantBrand } from '../config/schema';
 import {
+  getAgentBackend,
   getAgentStopGraceMs,
   getEnforceProjectRootSandbox,
   getMaxConcurrentRuns,
@@ -105,6 +116,8 @@ export interface CommandContext {
   controls: Controls;
   /** Set when invoked from a CardKit 2.0 form submit. Keys are input `name`s. */
   formValue?: Record<string, unknown>;
+  /** Raw callback value of the clicked card action. */
+  cardPayload?: Record<string, unknown>;
   /** True when this invocation came from a card button click rather than a
    * text command. Determines whether to update the existing card vs send a
    * new one. */
@@ -132,6 +145,7 @@ const handlers: Record<string, Handler> = {
   '/cd': handleCd,
   '/ws': handleWs,
   '/status': handleStatus,
+  '/model': handleModel,
   '/sync': handleSync,
   '/help': handleHelp,
   '/account': handleAccount,
@@ -158,6 +172,7 @@ const ADMIN_COMMANDS = new Set([
   '/doctor',
   '/cd',
   '/ws',
+  '/model',
 ]);
 
 function isAdminCommand(cmd: string): boolean {
@@ -217,9 +232,11 @@ export async function runCommandHandler(
       sender: ctx.msg.senderId.slice(-6),
       via: 'card',
     });
-    // Card actions can't reply naturally (the `msg` is synthesized); the
-    // click is silently denied. The button only renders for users who got
-    // the original admin card in the first place, so this is an edge case.
+    // Model switching has a dedicated user-facing denial: the status card
+    // button is visible to everyone, so silence here would look broken.
+    if (name === 'model') {
+      await reply(ctx, '仅管理员可切换模型');
+    }
     return true;
   }
   try {
@@ -947,6 +964,260 @@ async function handleStatus(_args: string, ctx: CommandContext): Promise<void> {
     model,
   });
   await sendCommandCard(ctx, card);
+}
+
+async function modelThreadId(ctx: CommandContext): Promise<string | undefined> {
+  const project = ctx.projectBindings?.findProjectByChat(ctx.msg.chatId);
+  if (project) {
+    return ctx.msg.threadId
+      ? ctx.projectBindings?.findTopic(ctx.msg.chatId, ctx.msg.threadId)?.codexThreadId
+      : undefined;
+  }
+  return ctx.sessions.getRaw(ctx.scope)?.sessionId;
+}
+
+async function readModelState(ctx: CommandContext, threadId: string): Promise<ThreadModelState | undefined> {
+  try {
+    return await ctx.agent.readThreadModel?.(threadId);
+  } catch (err) {
+    log.warn('commands', 'model-state-read-failed', {
+      threadId,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return undefined;
+  }
+}
+
+async function listModelOptions(
+  ctx: CommandContext,
+  includeHidden: boolean,
+  forceRefresh = false,
+): Promise<ModelOption[] | undefined> {
+  if (!ctx.agent.listModels) return undefined;
+  try {
+    return await ctx.agent.listModels({ includeHidden, forceRefresh });
+  } catch (err) {
+    log.warn('commands', 'model-list-failed', {
+      includeHidden,
+      forceRefresh,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return undefined;
+  }
+}
+
+function modelDisplayName(models: ModelOption[] | undefined, modelId?: string | null): string {
+  if (!modelId) return '未知';
+  return models?.find((model) => model.model === modelId || model.id === modelId)?.displayName ?? modelId;
+}
+
+function modelIdFromForm(ctx: CommandContext): string | undefined {
+  const raw = ctx.formValue?.model_id ?? ctx.cardPayload?.model_id;
+  return typeof raw === 'string' && raw.trim() ? raw : undefined;
+}
+
+function effortFromForm(ctx: CommandContext): string | undefined {
+  const raw = ctx.formValue?.effort;
+  const value = Array.isArray(raw) ? raw[0] : raw;
+  return typeof value === 'string' && value.trim() ? value : undefined;
+}
+
+async function addCurrentModel(
+  ctx: CommandContext,
+  models: ModelOption[],
+  currentModel: string | null | undefined,
+): Promise<ModelOption[]> {
+  if (!currentModel || models.some((model) => model.model === currentModel)) return models;
+  const all = await listModelOptions(ctx, true);
+  const current = all?.find((model) => model.model === currentModel);
+  return current ? [current, ...models] : models;
+}
+
+async function openModelStep1(
+  ctx: CommandContext,
+  threadId: string,
+  notice?: string,
+): Promise<void> {
+  const state = await readModelState(ctx, threadId);
+  const models = await listModelOptions(ctx, false);
+  if (!models) {
+    const current = state?.model ? `当前模型：${modelDisplayName(undefined, state.model)}。` : '';
+    await sendCommandCard(ctx, modelErrorCard(
+      '无法读取模型列表',
+      [current, '读取模型列表失败，请稍后重试。'].filter(Boolean).join('\n'),
+    ));
+    return;
+  }
+  if (models.length === 0) {
+    const current = state?.model ? `当前模型：${modelDisplayName(undefined, state.model)}。` : '';
+    await sendCommandCard(ctx, modelErrorCard(
+      '没有可用模型',
+      [current, '模型列表为空，请稍后重试。'].filter(Boolean).join('\n'),
+    ));
+    return;
+  }
+  await sendCommandCard(ctx, modelSelectCard(
+    await addCurrentModel(ctx, models, state?.model),
+    state?.model,
+    notice,
+  ));
+}
+
+async function openModelStep2(ctx: CommandContext, threadId: string): Promise<void> {
+  const modelId = modelIdFromForm(ctx);
+  if (!modelId) {
+    await openModelStep1(ctx, threadId);
+    return;
+  }
+  const state = await readModelState(ctx, threadId);
+  const models = await listModelOptions(ctx, true);
+  if (!models) {
+    await sendCommandCard(ctx, modelErrorCard('无法读取模型列表', '读取模型列表失败，请稍后重试。'));
+    return;
+  }
+  const model = models.find((item) => item.model === modelId || item.id === modelId);
+  if (!model) {
+    await openModelStep1(ctx, threadId, '模型列表已更新，请重新选择');
+    return;
+  }
+  if (model.supportedReasoningEfforts.length === 0 && !model.defaultReasoningEffort) {
+    await openModelStep1(ctx, threadId, '该模型没有可用的推理强度，请换一个模型。');
+    return;
+  }
+  await sendCommandCard(ctx, effortSelectCard(model, state?.effort));
+}
+
+async function applyModelChoice(ctx: CommandContext, threadId: string): Promise<void> {
+  const modelId = modelIdFromForm(ctx);
+  const requestedEffort = effortFromForm(ctx);
+  if (!modelId || !requestedEffort) {
+    await openModelStep1(ctx, threadId, '选择已失效，请重新选择模型与强度。');
+    return;
+  }
+  const models = await listModelOptions(ctx, true, true);
+  if (!models) {
+    await sendCommandCard(ctx, modelErrorCard('无法读取模型列表', '读取模型列表失败，请稍后重试。'));
+    return;
+  }
+  if (models.length === 0) {
+    await sendCommandCard(ctx, modelErrorCard('没有可用模型', '模型列表为空，请稍后重试。'));
+    return;
+  }
+  const model = models.find((item) => item.model === modelId || item.id === modelId);
+  if (!model) {
+    await openModelStep1(ctx, threadId, '模型列表已更新，请重新选择');
+    return;
+  }
+  const effort = requestedEffort === MODEL_DEFAULT_EFFORT
+    ? model.defaultReasoningEffort ?? model.supportedReasoningEfforts[0]
+    : requestedEffort;
+  if (!effort || !model.supportedReasoningEfforts.includes(effort)) {
+    await openModelStep1(ctx, threadId, '模型列表已更新，请重新选择');
+    return;
+  }
+  if (!ctx.agent.switchThreadModel) {
+    await sendCommandCard(ctx, modelErrorCard('无法切换模型', '当前后端不支持切换模型。'));
+    return;
+  }
+  const before = await readModelState(ctx, threadId);
+  const result: ModelSwitchResult = await ctx.agent.switchThreadModel(threadId, { model: model.model, effort });
+  const previousModelId = result.previous?.model ?? before?.model ?? null;
+  const previousEffort = result.previous?.effort ?? before?.effort ?? null;
+  log.info('command', 'model-switch', {
+    scope: ctx.scope,
+    threadId,
+    operatorId: ctx.msg.senderId.slice(-6),
+    operatorName: ctx.msg.senderName,
+    previousModel: previousModelId,
+    previousEffort,
+    nextModel: model.model,
+    nextEffort: effort,
+    result: result.status,
+  });
+  if (result.status === 'applied') {
+    await sendCommandCard(ctx, modelSwitchSuccessCard({
+      previousModel: modelDisplayName(models, previousModelId),
+      previousEffort,
+      nextModel: model.displayName,
+      nextEffort: effort,
+      operatorName: ctx.msg.senderName ?? ctx.msg.senderId,
+      at: new Date(),
+      fallbackFrom: previousEffort
+        && previousEffort !== effort
+        && !model.supportedReasoningEfforts.includes(previousEffort)
+        && (requestedEffort === MODEL_DEFAULT_EFFORT || requestedEffort === model.defaultReasoningEffort)
+        ? previousEffort
+        : undefined,
+    }));
+    return;
+  }
+  if (result.status === 'active_writer') {
+    await sendCommandCard(ctx, modelErrorCard(
+      '会话被桌面端占用',
+      result.message ?? '桌面端正在使用这个会话，请在桌面端关闭该会话后重试',
+    ));
+    return;
+  }
+  if (result.status === 'unconfirmed') {
+    await sendCommandCard(ctx, modelErrorCard(
+      '模型设置未确认',
+      '模型设置已提交，但回读未确认。请稍后用 /status 查看当前模型。',
+    ));
+    return;
+  }
+  await sendCommandCard(ctx, modelErrorCard(
+    '模型切换失败',
+    result.message ?? '切换模型失败，请稍后重试。',
+  ));
+}
+
+async function handleModel(args: string, ctx: CommandContext): Promise<void> {
+  try {
+    await handleModelInner(args, ctx);
+  } finally {
+    await releaseWriterIfAllIdle(ctx.activeRuns, ctx.agent);
+  }
+}
+
+async function handleModelInner(args: string, ctx: CommandContext): Promise<void> {
+  if (!isAdmin(ctx.controls.cfg, ctx.msg.senderId)) {
+    await reply(ctx, '仅管理员可切换模型');
+    return;
+  }
+  if (getAgentBackend(ctx.controls.cfg) !== 'codex') {
+    await reply(ctx, '当前是 OMP 会话，模型切换仅支持 Codex');
+    return;
+  }
+  if (ctx.activeRuns.has(ctx.scope)) {
+    await reply(ctx, '任务执行中，结束后再切换');
+    return;
+  }
+  const threadId = await modelThreadId(ctx);
+  if (!threadId) {
+    await sendCommandCard(ctx, modelErrorCard(
+      '尚未开始',
+      '尚未开始（发送第一条消息后才有会话模型）',
+    ));
+    return;
+  }
+  const command = args.trim();
+  if (!command || command === 'reload' || command === 'back') {
+    await openModelStep1(ctx, threadId);
+    return;
+  }
+  if (command === 'choose-model') {
+    await openModelStep2(ctx, threadId);
+    return;
+  }
+  if (command === 'apply') {
+    await applyModelChoice(ctx, threadId);
+    return;
+  }
+  if (command === 'default') {
+    await sendCommandCard(ctx, modelNoticeCard('后续版本', '清除模型选择将在后续版本提供；当前会话保留它原来的模型。'));
+    return;
+  }
+  await reply(ctx, '用法：发送 /model 打开模型选择卡。');
 }
 
 async function handleSync(args: string, ctx: CommandContext): Promise<void> {

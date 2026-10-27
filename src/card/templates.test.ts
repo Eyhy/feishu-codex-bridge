@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { projectWelcomeCard, projectsCard, sessionDetailCard, sessionProgressCard, sessionSearchCard, sessionsCard, statusCard, taskDetailCard, tasksCard, presetsCard, topicTitle, topicWelcomeCard, welcomeCard } from './templates';
+import { helpCard, projectWelcomeCard, projectsCard, sessionDetailCard, sessionProgressCard, sessionSearchCard, sessionsCard, statusCard, taskDetailCard, tasksCard, presetsCard, topicTitle, topicWelcomeCard, welcomeCard } from './templates';
 import type { SessionDetail } from '../project/types';
 import type { TaskRecord } from '../task/types';
 
@@ -132,6 +132,7 @@ describe('project-first Feishu cards', () => {
       model: { displayName: 'Astra', effort: 'high' },
     }));
     expect(card).toContain('模型：Astra · 强度：高');
+    expect(card).toContain('切换模型');
   });
 
   it('maps every documented reasoning effort to its Chinese label', () => {
@@ -175,6 +176,7 @@ describe('project-first Feishu cards', () => {
     };
     expect(text(statusCard({ ...info, model: {} }))).toContain('模型：尚未开始（发送第一条消息后才有会话模型）');
     expect(text(statusCard(info))).not.toContain('模型：');
+    expect(text(statusCard(info))).not.toContain('切换模型');
   });
 
   it('marks a pending model choice on the status card', () => {
@@ -188,5 +190,9 @@ describe('project-first Feishu cards', () => {
       model: { displayName: 'Astra', effort: 'high', pendingDisplayName: 'Sol' },
     }));
     expect(rendered).toContain('模型：Astra（待生效：Sol）');
+  });
+
+  it('lists the model command in help', () => {
+    expect(text(helpCard())).toContain('/model');
   });
 });

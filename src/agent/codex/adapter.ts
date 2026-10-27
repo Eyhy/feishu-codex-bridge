@@ -1,4 +1,4 @@
-import type { AgentAdapter, AgentAdditionalContext, AgentEvent, AgentRun, AgentRunOptions, AgentUiResponse, ListModelsOptions, ModelOption, ThreadModelState } from '../types';
+import type { AgentAdapter, AgentAdditionalContext, AgentEvent, AgentRun, AgentRunOptions, AgentUiResponse, ListModelsOptions, ModelChoice, ModelOption, ModelSwitchResult, ThreadModelState } from '../types';
 import { ThreadModelReadError } from '../types';
 import { log } from '../../core/logger';
 import { CodexAppServerClient, type JsonRpcNotification, type JsonRpcServerRequest } from './app-server';
@@ -206,6 +206,65 @@ export class CodexAdapter implements AgentAdapter {
       const effort = typeof thread.reasoningEffort === 'string' && thread.reasoningEffort.trim() ? thread.reasoningEffort.trim() : null;
       const canAcceptDirectInput = typeof thread.canAcceptDirectInput === 'boolean' ? thread.canAcceptDirectInput : null;
       return { model, effort, canAcceptDirectInput, loaded: canAcceptDirectInput !== null };
+    } finally {
+      this.endOperation();
+    }
+  }
+
+  async switchThreadModel(threadId: string, choice: ModelChoice): Promise<ModelSwitchResult> {
+    this.beginOperation();
+    try {
+      let state: ThreadModelState;
+      try {
+        state = await this.readThreadModel(threadId);
+      } catch (err) {
+        return { status: 'failed', message: errorMessage(err) };
+      }
+      const previous = { model: state.model, effort: state.effort };
+      if (!state.loaded) {
+        try {
+          await this.client.request('thread/resume', { threadId });
+        } catch (err) {
+          return {
+            status: isActiveWriterError(err) ? 'active_writer' : 'failed',
+            previous,
+            message: isActiveWriterError(err) ? CODEX_ACTIVE_WRITER_MESSAGE : errorMessage(err),
+          };
+        }
+      }
+      try {
+        await this.client.request('thread/settings/update', {
+          threadId,
+          model: choice.model,
+          effort: choice.effort,
+        });
+      } catch (err) {
+        return {
+          status: isActiveWriterError(err) ? 'active_writer' : 'failed',
+          previous,
+          message: isActiveWriterError(err) ? CODEX_ACTIVE_WRITER_MESSAGE : errorMessage(err),
+        };
+      }
+      let after: ThreadModelState;
+      try {
+        after = await this.readThreadModel(threadId);
+      } catch (err) {
+        return {
+          status: 'unconfirmed',
+          previous,
+          next: choice,
+          message: errorMessage(err),
+        };
+      }
+      if (after.model !== choice.model || after.effort !== choice.effort) {
+        return {
+          status: 'failed',
+          previous,
+          next: choice,
+          message: '模型设置已提交，但回读结果与选择不一致',
+        };
+      }
+      return { status: 'applied', previous, next: choice };
     } finally {
       this.endOperation();
     }
@@ -788,6 +847,10 @@ export class CodexAdapter implements AgentAdapter {
       },
     };
   }
+}
+
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
 }
 
 function isMissingRolloutError(err: unknown): boolean {

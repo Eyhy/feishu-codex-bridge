@@ -126,6 +126,7 @@ export async function handleCardAction(deps: CardDispatchDeps): Promise<void> {
     agent: deps.agent,
     controls: deps.controls,
     formValue,
+    cardPayload: payload,
     fromCardAction: true,
     projectCatalog: deps.projectCatalog,
     projectBindings: deps.projectBindings,
@@ -223,11 +224,11 @@ async function respondToOmpUi(
  * string the text-command handler expects: 'use proj-a'. Accepts `arg`
  * (preferred, generic) or `name` (legacy ws cards). */
 function composeArgs(sub: string, payload: Record<string, unknown>): string {
-  if (!sub) return '';
   const arg =
     (typeof payload.arg === 'string' && payload.arg) ||
     (typeof payload.name === 'string' && payload.name) ||
     '';
+  if (!sub) return arg;
   return arg ? `${sub} ${arg}` : sub;
 }
 

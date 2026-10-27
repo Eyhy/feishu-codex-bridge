@@ -6,7 +6,7 @@ import { CODEX_ACTIVE_WRITER_MESSAGE, CodexAdapter } from './adapter';
 import { ThreadModelReadError } from '../types';
 import type { AgentEvent } from '../types';
 
-async function fakeCodex(options: { rejectDesktopMetadata?: boolean; rejectAdditionalContext?: boolean; interaction?: 'questions' | 'approval'; activeWriter?: boolean } = {}): Promise<string> {
+async function fakeCodex(options: { rejectDesktopMetadata?: boolean; rejectAdditionalContext?: boolean; interaction?: 'questions' | 'approval'; activeWriter?: boolean; ignoreSettings?: boolean } = {}): Promise<string> {
   const dir = await mkdtemp(join(tmpdir(), 'codex-adapter-test-'));
   const path = join(dir, 'codex-fake.mjs');
   await writeFile(path, `#!/usr/bin/env node
@@ -20,6 +20,12 @@ const rejectDesktopMetadata = ${JSON.stringify(Boolean(options.rejectDesktopMeta
 const rejectAdditionalContext = ${JSON.stringify(Boolean(options.rejectAdditionalContext))};
 const interaction = ${JSON.stringify(options.interaction ?? '')};
 const activeWriter = ${JSON.stringify(Boolean(options.activeWriter))};
+const ignoreSettings = ${JSON.stringify(Boolean(options.ignoreSettings))};
+const threadSettings = new Map([
+  ['thread-existing', { model: 'gpt-5.6-sol', effort: 'high' }],
+  ['thread-cold', { model: 'gpt-5.6-sol', effort: 'high' }],
+]);
+const loadedThreads = new Set(['thread-existing']);
 for (const signal of ['SIGTERM', 'SIGINT']) process.on(signal, () => { appendFileSync(requestLog, JSON.stringify({ event: 'app-server-exit', signal }) + '\\n'); process.exit(0); });
 let activeThreadId = 'thread-new';
 let activeThreadName = '';
@@ -44,21 +50,29 @@ for await (const line of rl) {
     }
     activeThreadId = 'thread-new';
     activeThreadName = '';
+    loadedThreads.add('thread-new');
     send({ id: msg.id, result: { thread: { id: 'thread-new', name: null, preview: '', cwd: '/tmp/project' } } });
   }
   if (msg.method === 'thread/resume') {
     if (msg.params.threadId === 'missing-rollout') send({ id: msg.id, error: { code: -32000, message: 'no rollout found for thread id missing-rollout' } });
     else if (activeWriter) send({ id: msg.id, error: { code: -32000, message: 'thread ' + msg.params.threadId + ' already has an active writer' } });
     else if (msg.params.threadId === 'unloaded') send({ id: msg.id, result: { thread: { id: 'unloaded', sessionId: 'session-2', name: '恢复会话', preview: '恢复详情', cwd: '/tmp/project', updatedAt: 30, status: { type: 'idle' }, source: 'vscode', turns: [{ items: [{ type: 'agentMessage', text: '已恢复' }] }] } } });
-    else { activeThreadId = msg.params.threadId; send({ id: msg.id, result: { thread: { id: msg.params.threadId, cwd: '/tmp/project' } } }); }
+    else { activeThreadId = msg.params.threadId; loadedThreads.add(msg.params.threadId); send({ id: msg.id, result: { thread: { id: msg.params.threadId, cwd: '/tmp/project' } } }); }
   }
   if (msg.method === 'thread/read') {
     if (msg.params.threadId === 'missing-thread') send({ id: msg.id, error: { code: -32000, message: 'thread not found: missing-thread' } });
     else if (msg.params.threadId === 'unloaded') send({ id: msg.id, error: { code: -32000, message: 'thread not loaded: unloaded' } });
-    else send({ id: msg.id, result: { thread: { id: msg.params.threadId, sessionId: 'session-1', name: '详情会话', preview: '查看详情', cwd: '/tmp/project', updatedAt: 20, status: { type: 'active', activeFlags: ['waitingOnUserInput'] }, source: 'vscode', model: 'gpt-5.6-sol', reasoningEffort: 'high', canAcceptDirectInput: true, turns: [{ items: [{ type: 'userMessage', content: [{ type: 'text', text: '请查看', text_elements: [] }] }, { type: 'agentMessage', text: '正在查看' }, { type: 'commandExecution', command: 'pnpm test' }] }] } } });
+    else {
+      const settings = threadSettings.get(msg.params.threadId) ?? { model: 'gpt-5.6-sol', effort: 'high' };
+      send({ id: msg.id, result: { thread: { id: msg.params.threadId, sessionId: 'session-1', name: '详情会话', preview: '查看详情', cwd: '/tmp/project', updatedAt: 20, status: { type: 'active', activeFlags: ['waitingOnUserInput'] }, source: 'vscode', model: settings.model, reasoningEffort: settings.effort, canAcceptDirectInput: loadedThreads.has(msg.params.threadId) ? true : null, turns: [{ items: [{ type: 'userMessage', content: [{ type: 'text', text: '请查看', text_elements: [] }] }, { type: 'agentMessage', text: '正在查看' }, { type: 'commandExecution', command: 'pnpm test' }] }] } } });
+    }
   }
   if (msg.method === 'thread/name/set') {
     activeThreadName = msg.params.name;
+    send({ id: msg.id, result: {} });
+  }
+  if (msg.method === 'thread/settings/update') {
+    if (!ignoreSettings) threadSettings.set(msg.params.threadId, { model: msg.params.model, effort: msg.params.effort });
     send({ id: msg.id, result: {} });
   }
   if (msg.method === 'turn/start') {
@@ -366,6 +380,75 @@ describe('CodexAdapter', () => {
     expect(requests.some((request) => request.method === 'thread/resume')).toBe(false);
     expect(requests.some((request) => request.method === 'thread/read' && request.params?.includeTurns)).toBe(false);
     await expect(adapter.readThreadModel('missing-thread')).rejects.toBeInstanceOf(ThreadModelReadError);
+    await adapter.close();
+  });
+
+  it('switches a loaded thread model and confirms both values by read-back', async () => {
+    const binary = await fakeCodex();
+    const adapter = new CodexAdapter({ binary });
+    await expect(adapter.switchThreadModel('thread-existing', {
+      model: 'gpt-6-astra',
+      effort: 'ultra',
+    })).resolves.toEqual({
+      status: 'applied',
+      previous: { model: 'gpt-5.6-sol', effort: 'high' },
+      next: { model: 'gpt-6-astra', effort: 'ultra' },
+    });
+    const requests = await readRequests(binary);
+    expect(requests.some((request) => request.method === 'thread/resume')).toBe(false);
+    expect(requests.find((request) => request.method === 'thread/settings/update')?.params).toEqual({
+      threadId: 'thread-existing',
+      model: 'gpt-6-astra',
+      effort: 'ultra',
+    });
+    await expect(adapter.readThreadModel('thread-existing')).resolves.toMatchObject({
+      model: 'gpt-6-astra',
+      effort: 'ultra',
+    });
+    await adapter.close();
+  });
+
+  it('resumes an unloaded thread before writing its model settings', async () => {
+    const binary = await fakeCodex();
+    const adapter = new CodexAdapter({ binary });
+    await expect(adapter.readThreadModel('thread-cold')).resolves.toMatchObject({
+      model: 'gpt-5.6-sol',
+      effort: 'high',
+      loaded: false,
+    });
+    await expect(adapter.switchThreadModel('thread-cold', {
+      model: 'gpt-6-astra',
+      effort: 'medium',
+    })).resolves.toMatchObject({ status: 'applied' });
+    const methods = (await readRequests(binary)).map((request) => request.method);
+    expect(methods.indexOf('thread/resume')).toBeGreaterThan(methods.indexOf('thread/read'));
+    expect(methods.indexOf('thread/settings/update')).toBeGreaterThan(methods.indexOf('thread/resume'));
+    expect(methods.lastIndexOf('thread/read')).toBeGreaterThan(methods.indexOf('thread/settings/update'));
+    await adapter.close();
+  });
+
+  it('reports an active writer while switching a thread model', async () => {
+    const binary = await fakeCodex({ activeWriter: true });
+    const adapter = new CodexAdapter({ binary });
+    const result = await adapter.switchThreadModel('thread-cold', {
+      model: 'gpt-6-astra',
+      effort: 'medium',
+    });
+    expect(result.status).toBe('active_writer');
+    expect(result.message).toBe(CODEX_ACTIVE_WRITER_MESSAGE);
+    const requests = await readRequests(binary);
+    expect(requests.some((request) => request.method === 'thread/settings/update')).toBe(false);
+    await adapter.close();
+  });
+
+  it('fails when the settings write cannot be confirmed by read-back', async () => {
+    const adapter = new CodexAdapter({ binary: await fakeCodex({ ignoreSettings: true }) });
+    const result = await adapter.switchThreadModel('thread-existing', {
+      model: 'gpt-6-astra',
+      effort: 'ultra',
+    });
+    expect(result.status).toBe('failed');
+    expect(result.next).toEqual({ model: 'gpt-6-astra', effort: 'ultra' });
     await adapter.close();
   });
 

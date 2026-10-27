@@ -6,7 +6,7 @@ import { CODEX_ACTIVE_WRITER_MESSAGE, CodexAdapter } from './adapter';
 import { ThreadModelReadError } from '../types';
 import type { AgentEvent } from '../types';
 
-async function fakeCodex(options: { rejectDesktopMetadata?: boolean; rejectAdditionalContext?: boolean; interaction?: 'questions' | 'approval'; activeWriter?: boolean; ignoreSettings?: boolean; modelListFailure?: 'throw' | 'empty'; settingsFailure?: boolean; readFailure?: boolean } = {}): Promise<string> {
+async function fakeCodex(options: { rejectDesktopMetadata?: boolean; rejectAdditionalContext?: boolean; interaction?: 'questions' | 'approval'; activeWriter?: boolean; ignoreSettings?: boolean; modelListFailure?: 'throw' | 'empty'; modelListMissingOnce?: boolean; modelListSecondFailure?: 'throw' | 'empty'; settingsFailure?: boolean; readFailure?: boolean; resumeSettings?: { model: string | null; effort: string | null } } = {}): Promise<string> {
   const dir = await mkdtemp(join(tmpdir(), 'codex-adapter-test-'));
   const path = join(dir, 'codex-fake.mjs');
   await writeFile(path, `#!/usr/bin/env node
@@ -22,7 +22,11 @@ const interaction = ${JSON.stringify(options.interaction ?? '')};
 const activeWriter = ${JSON.stringify(Boolean(options.activeWriter))};
 const ignoreSettings = ${JSON.stringify(Boolean(options.ignoreSettings))};
 const modelListFailure = ${JSON.stringify(options.modelListFailure ?? '')};
+const modelListMissingOnce = ${JSON.stringify(Boolean(options.modelListMissingOnce))};
+const modelListSecondFailure = ${JSON.stringify(options.modelListSecondFailure ?? '')};
+const resumeSettings = ${JSON.stringify(options.resumeSettings ?? null)};
 const settingsFailure = ${JSON.stringify(Boolean(options.settingsFailure))};
+let modelListCalls = 0;
 const readFailure = ${JSON.stringify(Boolean(options.readFailure))};
 const threadSettings = new Map([
   ['thread-existing', { model: 'gpt-5.6-sol', effort: 'high' }],
@@ -39,13 +43,21 @@ for await (const line of rl) {
   if (msg.method === 'initialize') send({ id: msg.id, result: {} });
   if (msg.method === 'thread/list') send({ id: msg.id, result: { data: [{ id: 'thread-existing', name: msg.params.searchTerm ? '匹配会话' : activeThreadName || '旧会话', preview: '修复卡片', cwd: '/tmp/project', updatedAt: 10, status: { type: 'idle' } }], nextCursor: msg.params.cursor ? null : 'cursor-2', backwardsCursor: null } });
   if (msg.method === 'model/list') {
-    if (modelListFailure === 'throw') send({ id: msg.id, error: { code: -32000, message: 'model list unavailable' } });
+    modelListCalls += 1;
+    if (modelListSecondFailure === 'throw' && modelListCalls > 1) send({ id: msg.id, error: { code: -32000, message: 'model list unavailable on refresh' } });
+    else if (modelListSecondFailure === 'empty' && modelListCalls > 1) send({ id: msg.id, result: { data: [] } });
+    else if (modelListFailure === 'throw') send({ id: msg.id, error: { code: -32000, message: 'model list unavailable' } });
     else if (modelListFailure === 'empty') send({ id: msg.id, result: { data: [] } });
-    else send({ id: msg.id, result: { data: [
-      { id: 'gpt-5.6-sol', model: 'gpt-5.6-sol', displayName: 'Sol', description: '默认模型', hidden: false, isDefault: true, defaultReasoningEffort: 'high', supportedReasoningEfforts: [{ description: '低', reasoningEffort: 'low' }, { description: '高', reasoningEffort: 'high' }] },
-      { id: 'gpt-6-astra', model: 'gpt-6-astra', displayName: 'Astra', description: '实验模型', hidden: false, isDefault: false, defaultReasoningEffort: 'medium', supportedReasoningEfforts: [{ description: '中', reasoningEffort: 'medium' }, { description: '最高', reasoningEffort: 'ultra' }] },
-      { id: 'hidden-model', model: 'hidden-model', displayName: 'Hidden', description: '', hidden: true, isDefault: false, defaultReasoningEffort: 'low', supportedReasoningEfforts: [] },
-    ] } });
+    else {
+      const data = [
+        { id: 'gpt-5.6-sol', model: 'gpt-5.6-sol', displayName: 'Sol', description: '默认模型', hidden: false, isDefault: true, defaultReasoningEffort: 'high', supportedReasoningEfforts: [{ description: '低', reasoningEffort: 'low' }, { description: '高', reasoningEffort: 'high' }] },
+        { id: 'gpt-6-astra', model: 'gpt-6-astra', displayName: 'Astra', description: '实验模型', hidden: false, isDefault: false, defaultReasoningEffort: 'medium', supportedReasoningEfforts: [{ description: '中', reasoningEffort: 'medium' }, { description: '最高', reasoningEffort: 'ultra' }] },
+        { id: 'hidden-model', model: 'hidden-model', displayName: 'Hidden', description: '', hidden: true, isDefault: false, defaultReasoningEffort: 'low', supportedReasoningEfforts: [] },
+      ];
+      send({ id: msg.id, result: { data: modelListMissingOnce && modelListCalls === 1
+        ? data.filter((model) => model.model !== 'gpt-6-astra')
+        : data } });
+    }
   }
   if (msg.method === 'thread/start') {
     if (rejectDesktopMetadata && msg.params.threadSource) {
@@ -65,7 +77,12 @@ for await (const line of rl) {
     if (msg.params.threadId === 'missing-rollout') send({ id: msg.id, error: { code: -32000, message: 'no rollout found for thread id missing-rollout' } });
     else if (activeWriter) send({ id: msg.id, error: { code: -32000, message: 'thread ' + msg.params.threadId + ' already has an active writer' } });
     else if (msg.params.threadId === 'unloaded') send({ id: msg.id, result: { thread: { id: 'unloaded', sessionId: 'session-2', name: '恢复会话', preview: '恢复详情', cwd: '/tmp/project', updatedAt: 30, status: { type: 'idle' }, source: 'vscode', turns: [{ items: [{ type: 'agentMessage', text: '已恢复' }] }] } } });
-    else { activeThreadId = msg.params.threadId; loadedThreads.add(msg.params.threadId); send({ id: msg.id, result: { thread: { id: msg.params.threadId, cwd: '/tmp/project' } } }); }
+    else {
+      activeThreadId = msg.params.threadId;
+      loadedThreads.add(msg.params.threadId);
+      const settings = resumeSettings ?? threadSettings.get(msg.params.threadId) ?? { model: 'gpt-5.6-sol', effort: 'high' };
+      send({ id: msg.id, result: { thread: { id: msg.params.threadId, cwd: '/tmp/project' }, model: settings.model, reasoningEffort: settings.effort } });
+    }
   }
   if (msg.method === 'thread/read') {
     if (readFailure && settingsWritten) send({ id: msg.id, error: { code: -32000, message: 'thread read failed after settings' } });
@@ -349,6 +366,137 @@ describe('CodexAdapter', () => {
     await adapter.close();
   });
 
+  it('preflights the resumed thread model before starting the turn', async () => {
+    const binary = await fakeCodex();
+    const adapter = new CodexAdapter({ binary });
+    await collect(adapter.run({ prompt: '继续处理', sessionId: 'thread-existing', cwd: '/tmp/project' }).events);
+    const requests = await readRequests(binary);
+    const methods = requests.map((request) => request.method);
+    expect(methods.indexOf('thread/resume')).toBeLessThan(methods.indexOf('model/list'));
+    expect(methods.indexOf('model/list')).toBeLessThan(methods.indexOf('turn/start'));
+    expect(requests.find((request) => request.method === 'model/list')?.params).toMatchObject({ includeHidden: true });
+    expect(requests.find((request) => request.method === 'turn/start')?.params).not.toHaveProperty('model');
+    await adapter.close();
+  });
+
+  it('fails the turn when the resumed thread model is unavailable', async () => {
+    const binary = await fakeCodex({ resumeSettings: { model: 'retired-model', effort: 'high' } });
+    const adapter = new CodexAdapter({ binary });
+    const events = await collect(adapter.run({ prompt: '继续处理', sessionId: 'thread-existing', cwd: '/tmp/project' }).events);
+    expect(events).toEqual([{
+      type: 'error',
+      message: '当前会话的模型 retired-model 在这台设备上不可用。请用 /model 重新选择模型，或 /new 新建会话。',
+    }]);
+    const requests = await readRequests(binary);
+    expect(requests.filter((request) => request.method === 'model/list')).toHaveLength(2);
+    expect(requests.some((request) => request.method === 'turn/start')).toBe(false);
+    expect(requests.some((request) => request.method === 'thread/start')).toBe(false);
+    expect(requests.some((request) => request.method === 'thread/fork')).toBe(false);
+    expect(requests.some((request) => request.method === 'thread/settings/update')).toBe(false);
+    await adapter.close();
+  });
+
+  it('fails the turn when the resumed thread effort is unsupported', async () => {
+    const binary = await fakeCodex({ resumeSettings: { model: 'gpt-6-astra', effort: 'high' } });
+    const adapter = new CodexAdapter({ binary });
+    const events = await collect(adapter.run({ prompt: '继续处理', sessionId: 'thread-existing', cwd: '/tmp/project' }).events);
+    expect(events).toEqual([{
+      type: 'error',
+      message: '模型 gpt-6-astra 不支持强度 high。请用 /model 重新选择，或 /new 新建会话。',
+    }]);
+    const requests = await readRequests(binary);
+    expect(requests.some((request) => request.method === 'turn/start')).toBe(false);
+    expect(requests.some((request) => request.method === 'thread/start')).toBe(false);
+    expect(requests.some((request) => request.method === 'thread/fork')).toBe(false);
+    expect(requests.some((request) => request.method === 'thread/settings/update')).toBe(false);
+    await adapter.close();
+  });
+
+  it('skips the resumed thread preflight when model/list fails', async () => {
+    const binary = await fakeCodex({ modelListFailure: 'throw' });
+    const adapter = new CodexAdapter({ binary });
+    const events = await collect(adapter.run({ prompt: '继续处理', sessionId: 'thread-existing', cwd: '/tmp/project' }).events);
+    expect(events.some((event) => event.type === 'error')).toBe(false);
+    const requests = await readRequests(binary);
+    expect(requests.some((request) => request.method === 'turn/start')).toBe(true);
+    await adapter.close();
+  });
+
+  it('skips the resumed thread preflight when the model list is empty', async () => {
+    const binary = await fakeCodex({ modelListFailure: 'empty' });
+    const adapter = new CodexAdapter({ binary });
+    const events = await collect(adapter.run({ prompt: '继续处理', sessionId: 'thread-existing', cwd: '/tmp/project' }).events);
+    expect(events.some((event) => event.type === 'error')).toBe(false);
+    const requests = await readRequests(binary);
+    expect(requests.some((request) => request.method === 'turn/start')).toBe(true);
+    await adapter.close();
+  });
+
+  it('refreshes the model cache once before rejecting a resumed thread', async () => {
+    const binary = await fakeCodex({
+      modelListMissingOnce: true,
+      resumeSettings: { model: 'gpt-6-astra', effort: 'medium' },
+    });
+    const adapter = new CodexAdapter({ binary });
+    const events = await collect(adapter.run({ prompt: '继续处理', sessionId: 'thread-existing', cwd: '/tmp/project' }).events);
+    expect(events.some((event) => event.type === 'error')).toBe(false);
+    const requests = await readRequests(binary);
+    expect(requests.filter((request) => request.method === 'model/list')).toHaveLength(2);
+    expect(requests.some((request) => request.method === 'turn/start')).toBe(true);
+    await adapter.close();
+  });
+
+  it('skips the preflight when the forced model list refresh fails', async () => {
+    const binary = await fakeCodex({
+      modelListMissingOnce: true,
+      modelListSecondFailure: 'throw',
+      resumeSettings: { model: 'gpt-6-astra', effort: 'medium' },
+    });
+    const adapter = new CodexAdapter({ binary });
+    const events = await collect(adapter.run({ prompt: '继续处理', sessionId: 'thread-existing', cwd: '/tmp/project' }).events);
+    expect(events.some((event) => event.type === 'error')).toBe(false);
+    const requests = await readRequests(binary);
+    expect(requests.filter((request) => request.method === 'model/list')).toHaveLength(2);
+    expect(requests.some((request) => request.method === 'turn/start')).toBe(true);
+    await adapter.close();
+  });
+
+  it('preflights a pending model before replacing a thread with no rollout', async () => {
+    const binary = await fakeCodex();
+    const adapter = new CodexAdapter({ binary });
+    const events = await collect(adapter.run({
+      prompt: '继续处理',
+      sessionId: 'missing-rollout',
+      cwd: '/tmp/project',
+      pendingModel: 'retired-model',
+      pendingEffort: 'high',
+    }).events);
+    expect(events).toEqual([{
+      type: 'model_switch',
+      status: 'failed',
+      next: { model: 'retired-model', effort: 'high' },
+      message: '待生效的模型 retired-model 在这台设备上不可用。请重新选择模型。',
+    }, {
+      type: 'error',
+      message: '待生效的模型 retired-model 在这台设备上不可用。请重新选择模型。',
+    }]);
+    const requests = await readRequests(binary);
+    expect(requests.some((request) => request.method === 'thread/start')).toBe(false);
+    expect(requests.some((request) => request.method === 'turn/start')).toBe(false);
+    await adapter.close();
+  });
+
+  it('does not block a resumed thread whose model is unknown', async () => {
+    const binary = await fakeCodex({ resumeSettings: { model: null, effort: null } });
+    const adapter = new CodexAdapter({ binary });
+    const events = await collect(adapter.run({ prompt: '继续处理', sessionId: 'thread-existing', cwd: '/tmp/project' }).events);
+    expect(events.some((event) => event.type === 'error')).toBe(false);
+    const requests = await readRequests(binary);
+    expect(requests.some((request) => request.method === 'model/list')).toBe(false);
+    expect(requests.some((request) => request.method === 'turn/start')).toBe(true);
+    await adapter.close();
+  });
+
   it('replaces a historical thread when its model cannot compact', async () => {
     const adapter = new CodexAdapter({ binary: await fakeCodex() });
     const run = adapter.run({ prompt: '继续处理', sessionId: 'legacy-compact', cwd: '/tmp/project' });
@@ -376,7 +524,7 @@ describe('CodexAdapter', () => {
     const turnStart = requests.find((request) => request.method === 'turn/start');
     expect(turnStart).toBeDefined();
     expect(turnStart?.params).not.toHaveProperty('model');
-    expect(requests.some((request) => request.method === 'model/list')).toBe(false);
+    expect(requests.some((request) => request.method === 'thread/settings/update')).toBe(false);
     await adapter.close();
   });
 

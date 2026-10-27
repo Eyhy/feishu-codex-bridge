@@ -123,10 +123,6 @@ export function modelErrorCard(
   return shell2(title, elements);
 }
 
-export function modelNoticeCard(title: string, detail: string): object {
-  return shell2(title, [markdown(detail), button('查看状态', 'default', { cmd: 'status' })]);
-}
-
 export function modelPendingCard(modelName: string, effort: string): object {
   return shell2('已选择模型', [
     markdown(`**已选择 ${escapeMd(modelName)}；会话创建后生效**`),

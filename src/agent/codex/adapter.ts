@@ -49,6 +49,8 @@ export interface CodexAdapterOptions {
 
 interface ThreadResponse {
   id?: string;
+  model?: unknown;
+  reasoningEffort?: unknown;
   thread?: Record<string, unknown> & { id?: string };
 }
 
@@ -742,11 +744,12 @@ export class CodexAdapter implements AgentAdapter {
       finish();
     };
 
-    const validatePending = async (): Promise<{
+    const validateModelChoice = async (
+      choice: { model: string; effort?: string | null },
+    ): Promise<{
       kind: 'ok' | 'skip' | 'empty' | 'model_missing' | 'effort_missing';
       model?: ModelOption;
     }> => {
-      if (!pendingChoice) return { kind: 'ok' };
       let models: ModelOption[];
       try {
         models = await this.listModels({ includeHidden: true });
@@ -755,9 +758,9 @@ export class CodexAdapter implements AgentAdapter {
       }
       if (models.length === 0) return { kind: 'empty' };
       const check = (list: ModelOption[]): { kind: 'ok' | 'model_missing' | 'effort_missing'; model?: ModelOption } => {
-        const model = list.find((item) => item.model === pendingChoice.model || item.id === pendingChoice.model);
+        const model = list.find((item) => item.model === choice.model || item.id === choice.model);
         if (!model) return { kind: 'model_missing' };
-        if (!model.supportedReasoningEfforts.includes(pendingChoice.effort)) {
+        if (choice.effort && !model.supportedReasoningEfforts.includes(choice.effort)) {
           return { kind: 'effort_missing', model };
         }
         return { kind: 'ok', model };
@@ -775,7 +778,7 @@ export class CodexAdapter implements AgentAdapter {
 
     const checkPending = async (): Promise<boolean> => {
       if (!pendingChoice) return true;
-      const validation = await validatePending();
+      const validation = await validateModelChoice(pendingChoice);
       if (validation.kind === 'skip') return true;
       if (validation.kind === 'empty') {
         emitPendingFailure('validation_failed', '模型列表暂时为空，无法应用待生效模型，请稍后重试。');
@@ -794,6 +797,32 @@ export class CodexAdapter implements AgentAdapter {
           `待生效的模型 ${pendingChoice.model} 不支持强度 ${pendingChoice.effort}。请重新选择。`,
         );
         return false;
+      }
+      return true;
+    };
+
+    const rejectThreadModel = (message: string): false => {
+      queue.push({ type: 'error', message });
+      finish();
+      return false;
+    };
+
+    const checkThreadModel = async (
+      model: string | null | undefined,
+      effort: string | null | undefined,
+    ): Promise<boolean> => {
+      if (!model) return true;
+      const validation = await validateModelChoice({ model, effort });
+      if (validation.kind === 'skip' || validation.kind === 'empty') return true;
+      if (validation.kind === 'model_missing') {
+        return rejectThreadModel(
+          `当前会话的模型 ${model} 在这台设备上不可用。请用 /model 重新选择模型，或 /new 新建会话。`,
+        );
+      }
+      if (validation.kind === 'effort_missing') {
+        return rejectThreadModel(
+          `模型 ${model} 不支持强度 ${effort}。请用 /model 重新选择，或 /new 新建会话。`,
+        );
       }
       return true;
     };
@@ -818,6 +847,7 @@ export class CodexAdapter implements AgentAdapter {
               return;
             }
             if (!isMissingRolloutError(err)) throw err;
+            if (!(await checkPending())) return;
             queue.push({ type: 'ui_notice', message: '原 Codex 会话没有可恢复的执行记录，已自动新建会话。', level: 'warning' });
             thread = await this.startThread(opts.cwd);
           }
@@ -829,15 +859,9 @@ export class CodexAdapter implements AgentAdapter {
         if (!threadId) throw new Error('Codex app-server did not return a thread id');
         // A newly started thread has no earlier user choice to report; its
         // device default is not a previous model.
-        const previous = resumed
-          ? {
-              model: typeof thread.thread?.model === 'string' && thread.thread.model.trim() ? thread.thread.model.trim() : null,
-              effort: typeof thread.thread?.reasoningEffort === 'string' && thread.thread.reasoningEffort.trim()
-                ? thread.thread.reasoningEffort.trim()
-                : null,
-            }
-          : undefined;
+        const previous = resumed ? readThreadModelSettings(thread) : undefined;
         if (resumed && pendingChoice && !(await checkPending())) return;
+        if (resumed && !pendingChoice && !(await checkThreadModel(previous?.model, previous?.effort))) return;
         const currentName = typeof thread.thread?.name === 'string' ? thread.thread.name : undefined;
         const requestedName = opts.title?.replace(/\s+/g, ' ').trim();
         if (requestedName && currentName !== requestedName) {
@@ -1014,6 +1038,17 @@ export class CodexAdapter implements AgentAdapter {
       },
     };
   }
+}
+
+function readNonEmptyString(value: unknown): string | null {
+  return typeof value === 'string' && value.trim() ? value.trim() : null;
+}
+
+function readThreadModelSettings(thread: ThreadResponse): { model: string | null; effort: string | null } {
+  return {
+    model: readNonEmptyString(thread.model) ?? readNonEmptyString(thread.thread?.model),
+    effort: readNonEmptyString(thread.reasoningEffort) ?? readNonEmptyString(thread.thread?.reasoningEffort),
+  };
 }
 
 function errorMessage(err: unknown): string {

@@ -179,9 +179,9 @@ Bridge 默认不会把 `chat_id`、`sender_id`、`thread_id` 拼进可见 prompt
 
 ### 使用设备上的 Codex 配置
 
-Bridge 默认不会设置模型、代理、provider 或 service tier，而是让 Codex app-server 使用本机登录状态和配置。
-Codex 话题始终沿用该 Codex 线程自己的模型与推理强度；配置里的 `preferences.ompModel` / `codexModel` 只用于 OMP 后端，不会覆盖 Codex 线程。
-在飞书里发送 `/model` 可以切换当前话题的模型与推理强度；选择会写入当前 Codex 会话，桌面端下一轮沿用。
+Bridge 默认不设置模型、代理、provider 或 service tier，而是让 Codex app-server 使用本机登录状态和配置，只有 `/model` 显式选择后才写当前会话。
+Codex 话题默认沿用该 Codex 会话自己的模型与推理强度；配置里的 `preferences.ompModel` / `codexModel` 只用于 OMP 后端，不会覆盖 Codex 会话。
+在飞书里发送 `/model` 可以切换当前话题的模型与推理强度；选择会写入当前 Codex 会话，桌面端下一轮沿用。发送 `/model default` 清除飞书侧的选择，当前会话保留它自己的设置。
 
 macOS 上，未显式配置二进制时会优先使用 ChatGPT 桌面应用自带的 Codex runtime，避免系统 PATH 中的旧 CLI 无法解析桌面端模型缓存：
 
@@ -383,9 +383,12 @@ codex --version
 
 macOS 如果同时安装了旧 Homebrew CLI 和新版 ChatGPT 桌面端，优先使用桌面端 runtime。
 
+如果当前会话的模型或推理强度在这台设备上不可用，Bridge 会明确提示本轮失败：用 `/model` 重新选择，或用 `/new` 新建会话。
+
 ### 原会话无法恢复
 
 没有 rollout 或使用不兼容旧配置的历史会话会自动新建 Session 并重试。新 Session 继续使用相同项目目录。
+模型或推理强度不可用不会触发自动新建；Bridge 只提示并保留原来的会话绑定。
 
 ### 自动同步会不会刷屏
 

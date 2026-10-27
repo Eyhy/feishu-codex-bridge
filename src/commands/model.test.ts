@@ -365,6 +365,101 @@ describe('Codex model commands', () => {
     expect(send).toHaveBeenCalledWith('chat-dm', { markdown: '当前是 OMP 会话，模型切换仅支持 Codex' }, { replyTo: 'message-1' });
   });
 
+  it('clears a pending choice without touching a thread', async () => {
+    const send = vi.fn().mockResolvedValue({ messageId: 'message-2' });
+    const bindings = new JsonProjectBindingStore(join(await mkdtemp(join(tmpdir(), 'feishu-command-test-')), 'bindings.json'));
+    const readThreadModel = vi.fn();
+    const switchThreadModel = vi.fn();
+    const ctx = context({ send }, bindings);
+    ctx.controls.cfg = {
+      accounts: { app: { id: 'app-1', secret: 'secret', tenant: 'feishu' } },
+      preferences: { agentBackend: 'codex' },
+    } as never;
+    ctx.agent = { ...ctx.agent, readThreadModel, switchThreadModel };
+    ctx.sessions.setPending('chat-dm', { model: 'gpt-6-astra', effort: 'ultra' });
+
+    await runCommandHandler('model', 'default', ctx);
+
+    expect(ctx.sessions.getPending('chat-dm')).toBeUndefined();
+    expect(readThreadModel).not.toHaveBeenCalled();
+    expect(switchThreadModel).not.toHaveBeenCalled();
+    expect(send).toHaveBeenCalledWith('chat-dm', {
+      markdown: '已清除待生效选择，新会话跟随设备默认',
+    }, { replyTo: 'message-1' });
+  });
+
+  it('clears a pending choice and names the thread model', async () => {
+    const send = vi.fn().mockResolvedValue({ messageId: 'message-2' });
+    const bindings = new JsonProjectBindingStore(join(await mkdtemp(join(tmpdir(), 'feishu-command-test-')), 'bindings.json'));
+    bindings.registerProjects([project]);
+    await bindings.bindProject(project.projectKey, 'chat-project');
+    await bindings.bindTopic({
+      chatId: 'chat-project', topicId: 'topic-native', projectKey: project.projectKey,
+      codexThreadId: 'thread-1', createdBy: 'user-1', updatedAt: 1,
+    });
+    const readThreadModel = vi.fn().mockResolvedValue({
+      model: 'gpt-5.6-sol', effort: 'high', loaded: false, canAcceptDirectInput: null,
+    });
+    const listModels = vi.fn();
+    const switchThreadModel = vi.fn();
+    const ctx = context({ send }, bindings);
+    ctx.msg.chatId = 'chat-project';
+    ctx.msg.chatType = 'group';
+    ctx.msg.threadId = 'topic-native';
+    ctx.scope = 'chat-project:topic-native';
+    ctx.controls.cfg = {
+      accounts: { app: { id: 'app-1', secret: 'secret', tenant: 'feishu' } },
+      preferences: { agentBackend: 'codex' },
+    } as never;
+    ctx.agent = { ...ctx.agent, readThreadModel, listModels, switchThreadModel };
+    ctx.sessions.setPending('chat-project:topic-native', { model: 'gpt-6-astra', effort: 'ultra' });
+
+    await runCommandHandler('model', 'default', ctx);
+
+    expect(ctx.sessions.getPending('chat-project:topic-native')).toBeUndefined();
+    expect(readThreadModel).toHaveBeenCalledWith('thread-1');
+    expect(switchThreadModel).not.toHaveBeenCalled();
+    expect(send).toHaveBeenCalledWith('chat-project', {
+      markdown: '飞书不再设置模型，当前会话保留 gpt-5.6-sol（要换请重新选择）',
+    }, { replyTo: 'message-1' });
+  });
+
+  it('shows the full usage when /model gets an unknown argument', async () => {
+    const send = vi.fn().mockResolvedValue({ messageId: 'message-2' });
+    const bindings = new JsonProjectBindingStore(join(await mkdtemp(join(tmpdir(), 'feishu-command-test-')), 'bindings.json'));
+    const ctx = context({ send }, bindings);
+    ctx.controls.cfg = {
+      accounts: { app: { id: 'app-1', secret: 'secret', tenant: 'feishu' } },
+      preferences: { agentBackend: 'codex' },
+    } as never;
+
+    await runCommandHandler('model', 'bogus', ctx);
+
+    expect(send).toHaveBeenCalledWith('chat-dm', {
+      markdown: '用法：发送 /model 打开模型选择卡；发送 /model default 清除本话题的选择。',
+    }, { replyTo: 'message-1' });
+  });
+
+  it('refuses /model default while this topic has an active run', async () => {
+    const send = vi.fn().mockResolvedValue({ messageId: 'message-2' });
+    const bindings = new JsonProjectBindingStore(join(await mkdtemp(join(tmpdir(), 'feishu-command-test-')), 'bindings.json'));
+    const readThreadModel = vi.fn();
+    const ctx = context({ send }, bindings);
+    ctx.controls.cfg = {
+      accounts: { app: { id: 'app-1', secret: 'secret', tenant: 'feishu' } },
+      preferences: { agentBackend: 'codex' },
+    } as never;
+    ctx.agent = { ...ctx.agent, readThreadModel };
+    ctx.sessions.setPending('chat-dm', { model: 'gpt-6-astra', effort: 'ultra' });
+    ctx.activeRuns.register('chat-dm', { stop: vi.fn() } as never);
+
+    await runCommandHandler('model', 'default', ctx);
+
+    expect(ctx.sessions.getPending('chat-dm')).toEqual({ model: 'gpt-6-astra', effort: 'ultra' });
+    expect(readThreadModel).not.toHaveBeenCalled();
+    expect(send).toHaveBeenCalledWith('chat-dm', { markdown: '任务执行中，结束后再切换' }, { replyTo: 'message-1' });
+  });
+
   it('refuses to switch while this topic has an active run', async () => {
     const send = vi.fn().mockResolvedValue({ messageId: 'message-2' });
     const bindings = new JsonProjectBindingStore(join(await mkdtemp(join(tmpdir(), 'feishu-command-test-')), 'bindings.json'));

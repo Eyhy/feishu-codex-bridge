@@ -15,7 +15,6 @@ import {
   MODEL_DEFAULT_EFFORT,
   effortSelectCard,
   modelErrorCard,
-  modelNoticeCard,
   modelPendingCard,
   modelSelectCard,
   modelSwitchSuccessCard,
@@ -1213,6 +1212,20 @@ async function applyModelChoice(ctx: CommandContext, threadId: string | undefine
   ));
 }
 
+async function clearModelSelection(ctx: CommandContext, threadId: string | undefined): Promise<void> {
+  ctx.sessions.clearPending(ctx.scope);
+  if (!threadId) {
+    await reply(ctx, '已清除待生效选择，新会话跟随设备默认');
+    return;
+  }
+  const state = await readModelState(ctx, threadId);
+  if (!state?.model) {
+    await reply(ctx, '飞书不再设置模型，当前会话保留自己的模型（要换请重新选择）');
+    return;
+  }
+  await reply(ctx, `飞书不再设置模型，当前会话保留 ${state.model}（要换请重新选择）`);
+}
+
 async function handleModel(args: string, ctx: CommandContext): Promise<void> {
   try {
     await handleModelInner(args, ctx);
@@ -1236,6 +1249,10 @@ async function handleModelInner(args: string, ctx: CommandContext): Promise<void
   }
   const threadId = await modelThreadId(ctx);
   const command = args.trim();
+  if (command === 'default') {
+    await clearModelSelection(ctx, threadId);
+    return;
+  }
   if (!command || command === 'reload' || command === 'back') {
     await openModelStep1(ctx, threadId);
     return;
@@ -1248,11 +1265,7 @@ async function handleModelInner(args: string, ctx: CommandContext): Promise<void
     await applyModelChoice(ctx, threadId);
     return;
   }
-  if (command === 'default') {
-    await sendCommandCard(ctx, modelNoticeCard('后续版本', '清除模型选择将在后续版本提供；当前会话保留它原来的模型。'));
-    return;
-  }
-  await reply(ctx, '用法：发送 /model 打开模型选择卡。');
+  await reply(ctx, '用法：发送 /model 打开模型选择卡；发送 /model default 清除本话题的选择。');
 }
 
 async function handleSync(args: string, ctx: CommandContext): Promise<void> {

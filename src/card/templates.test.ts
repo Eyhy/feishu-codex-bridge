@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { projectWelcomeCard, projectsCard, sessionDetailCard, sessionProgressCard, sessionSearchCard, sessionsCard, taskDetailCard, tasksCard, presetsCard, topicTitle, topicWelcomeCard, welcomeCard } from './templates';
+import { projectWelcomeCard, projectsCard, sessionDetailCard, sessionProgressCard, sessionSearchCard, sessionsCard, statusCard, taskDetailCard, tasksCard, presetsCard, topicTitle, topicWelcomeCard, welcomeCard } from './templates';
 import type { SessionDetail } from '../project/types';
 import type { TaskRecord } from '../task/types';
 
@@ -119,5 +119,74 @@ describe('project-first Feishu cards', () => {
     const presets = text(presetsCard([{ id: 'check', name: '发布前检查', description: '检查类型和测试。' }]));
     expect(presets).toContain('发布前检查');
     expect(presets).toContain('使用模板');
+  });
+
+  it('shows the Codex thread model and Chinese reasoning strength on the status card', () => {
+    const card = text(statusCard({
+      cwd: '/tmp/project',
+      sessionId: 'thread-1',
+      sessionStale: false,
+      agentName: 'Codex',
+      scope: 'chat:topic',
+      chatMode: 'topic',
+      model: { displayName: 'Astra', effort: 'high' },
+    }));
+    expect(card).toContain('模型：Astra · 强度：高');
+  });
+
+  it('maps every documented reasoning effort to its Chinese label', () => {
+    const labels: Record<string, string> = { low: '低', medium: '中', high: '高', xhigh: '极高', ultra: '最高' };
+    for (const [effort, label] of Object.entries(labels)) {
+      const card = text(statusCard({
+        cwd: '/tmp/project',
+        sessionId: 'thread-1',
+        sessionStale: false,
+        agentName: 'Codex',
+        scope: 'chat:topic',
+        chatMode: 'topic',
+        model: { displayName: 'Astra', effort },
+      }));
+      expect(card).toContain(`强度：${label}`);
+    }
+  });
+
+  it('offers a refresh action when the model cannot be read', () => {
+    const rendered = text(statusCard({
+      cwd: '/tmp/project',
+      sessionId: 'thread-1',
+      sessionStale: false,
+      agentName: 'Codex',
+      scope: 'chat:topic',
+      chatMode: 'topic',
+      model: { readFailed: true, pendingDisplayName: 'Sol' },
+    }));
+    expect(rendered).toContain('模型：未知（点刷新重试）');
+    expect(rendered).toContain('待生效：Sol');
+    expect(rendered).toContain('刷新');
+  });
+
+  it('explains that a new topic has no session model yet and hides model lines for OMP', () => {
+    const info = {
+      cwd: '/tmp/project',
+      sessionStale: false,
+      agentName: 'Codex',
+      scope: 'chat',
+      chatMode: 'p2p' as const,
+    };
+    expect(text(statusCard({ ...info, model: {} }))).toContain('模型：尚未开始（发送第一条消息后才有会话模型）');
+    expect(text(statusCard(info))).not.toContain('模型：');
+  });
+
+  it('marks a pending model choice on the status card', () => {
+    const rendered = text(statusCard({
+      cwd: '/tmp/project',
+      sessionId: 'thread-1',
+      sessionStale: false,
+      agentName: 'Codex',
+      scope: 'chat:topic',
+      chatMode: 'topic',
+      model: { displayName: 'Astra', effort: 'high', pendingDisplayName: 'Sol' },
+    }));
+    expect(rendered).toContain('模型：Astra（待生效：Sol）');
   });
 });

@@ -1,4 +1,5 @@
-import type { AgentAdapter, AgentAdditionalContext, AgentEvent, AgentRun, AgentRunOptions, AgentUiResponse } from '../types';
+import type { AgentAdapter, AgentAdditionalContext, AgentEvent, AgentRun, AgentRunOptions, AgentUiResponse, ListModelsOptions, ModelOption, ThreadModelState } from '../types';
+import { ThreadModelReadError } from '../types';
 import { log } from '../../core/logger';
 import { CodexAppServerClient, type JsonRpcNotification, type JsonRpcServerRequest } from './app-server';
 import type { SessionActivity, SessionDetail, SessionPage, SessionSummary } from '../../project/types';
@@ -57,8 +58,8 @@ export class CodexAdapter implements AgentAdapter {
   readonly id = 'codex';
   readonly displayName = 'Codex';
   private readonly client: CodexAppServerClient;
-  private defaultModel?: string;
-  private defaultModelPromise?: Promise<string | undefined>;
+  private modelCache?: { models: ModelOption[]; expiresAt: number };
+  private modelCachePromise?: Promise<ModelOption[]>;
 
   constructor(opts: CodexAdapterOptions = {}) {
     this.client = new CodexAppServerClient(opts.binary);
@@ -72,31 +73,57 @@ export class CodexAdapter implements AgentAdapter {
     await this.client.close();
   }
 
-  /**
-   * Historical threads retain the model they were created with.  Resolve the
-   * current app-server default before resuming one so an old/incompatible
-   * model does not keep breaking an otherwise healthy device configuration.
-   */
-  private async resolveDefaultModel(): Promise<string | undefined> {
-    if (this.defaultModel) return this.defaultModel;
-    if (!this.defaultModelPromise) {
-      this.defaultModelPromise = this.client.request<{
-        data?: Array<{ model?: unknown; isDefault?: unknown }>;
-      }>('model/list', {}).then((response) => {
-        const model = response.data?.find((entry) => entry.isDefault === true && typeof entry.model === 'string')?.model;
-        if (typeof model === 'string' && model.trim()) {
-          this.defaultModel = model.trim();
-          return this.defaultModel;
-        }
-        return undefined;
-      }).catch((err) => {
-        log.warn('codex', 'default-model-unavailable', { error: err instanceof Error ? err.message : String(err) });
-        return undefined;
+  async listModels(opts: ListModelsOptions = {}): Promise<ModelOption[]> {
+    const cacheFresh = this.modelCache !== undefined && this.modelCache.expiresAt > Date.now();
+    if (!opts.forceRefresh && cacheFresh) return filterModels(this.modelCache!.models, opts.includeHidden);
+    if (!this.modelCachePromise) {
+      const pending = this.fetchModels().then((models) => {
+        this.modelCache = { models, expiresAt: Date.now() + 60_000 };
+        return models;
       }).finally(() => {
-        this.defaultModelPromise = undefined;
+        if (this.modelCachePromise === pending) this.modelCachePromise = undefined;
       });
+      this.modelCachePromise = pending;
     }
-    return this.defaultModelPromise;
+    const models = await this.modelCachePromise;
+    return filterModels(models, opts.includeHidden);
+  }
+
+  private async fetchModels(): Promise<ModelOption[]> {
+    const models: ModelOption[] = [];
+    let cursor: string | undefined;
+    do {
+      const response = await this.client.request<{
+        data?: Array<Record<string, unknown>>;
+        nextCursor?: string | null;
+      }>('model/list', {
+        includeHidden: true,
+        ...(cursor ? { cursor } : {}),
+      });
+      for (const entry of response.data ?? []) {
+        const mapped = mapModel(entry);
+        if (mapped) models.push(mapped);
+      }
+      cursor = response.nextCursor ?? undefined;
+    } while (cursor);
+    return models;
+  }
+
+  async readThreadModel(threadId: string): Promise<ThreadModelState> {
+    let response: { thread?: Record<string, unknown> };
+    try {
+      response = await this.client.request('thread/read', { threadId });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (isThreadNotFoundError(err)) throw new ThreadModelReadError('not_found', message);
+      throw new ThreadModelReadError('read_failed', message);
+    }
+    const thread = response.thread;
+    if (!thread) throw new ThreadModelReadError('read_failed', 'Codex app-server did not return the thread');
+    const model = typeof thread.model === 'string' && thread.model.trim() ? thread.model.trim() : null;
+    const effort = typeof thread.reasoningEffort === 'string' && thread.reasoningEffort.trim() ? thread.reasoningEffort.trim() : null;
+    const canAcceptDirectInput = typeof thread.canAcceptDirectInput === 'boolean' ? thread.canAcceptDirectInput : null;
+    return { model, effort, canAcceptDirectInput, loaded: canAcceptDirectInput !== null };
   }
 
   async listSessions(cwd: string): Promise<SessionSummary[]> {
@@ -301,7 +328,6 @@ export class CodexAdapter implements AgentAdapter {
     const pendingUi = new Map<string, PendingUi>();
     let threadId: string | undefined;
     let turnId: string | undefined;
-    let effectiveModel: string | undefined;
     let replacementStarted = false;
     let stopped = false;
     let settled = false;
@@ -552,8 +578,6 @@ export class CodexAdapter implements AgentAdapter {
         await this.client.ensureStarted();
         unsubscribe = this.client.onNotification(handleNotification);
         unsubscribeRequests = this.client.onServerRequest(handleServerRequest);
-        effectiveModel = opts.model ?? (opts.sessionId ? await this.resolveDefaultModel() : undefined);
-        if (opts.sessionId) log.info('codex', 'resolved-model', { sessionId: opts.sessionId, model: effectiveModel ?? null });
         let thread: ThreadResponse;
         if (opts.sessionId) {
           try {
@@ -576,13 +600,12 @@ export class CodexAdapter implements AgentAdapter {
         if (requestedName && currentName !== requestedName) {
           await this.setThreadName(threadId, requestedName);
         }
-        queue.push({ type: 'system', sessionId: threadId, cwd: opts.cwd, model: effectiveModel });
+        queue.push({ type: 'system', sessionId: threadId, cwd: opts.cwd });
         const turn = await requestTurn<{ id?: string; turn?: { id?: string } }>('turn/start', {
           threadId,
           input: [{ type: 'text', text: opts.prompt, text_elements: [] }],
           ...(opts.clientUserMessageId ? { clientUserMessageId: opts.clientUserMessageId } : {}),
           ...(opts.cwd ? { cwd: opts.cwd } : {}),
-          ...(opts.sessionId && effectiveModel && !replacementStarted ? { model: effectiveModel } : {}),
           ...(opts.additionalContext ? { additionalContext: opts.additionalContext } : {}),
         });
         turnId = turn.turn?.id ?? turn.id;
@@ -687,6 +710,48 @@ function isAdditionalContextCompatibilityError(err: unknown): boolean {
 function isThreadNotLoadedError(err: unknown): boolean {
   const message = err instanceof Error ? err.message : String(err);
   return /thread not loaded/i.test(message);
+}
+
+function isThreadNotFoundError(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err);
+  return /thread not found|thread .* not found|no rollout found|rollout not found/i.test(message);
+}
+
+function filterModels(models: ModelOption[], includeHidden = false): ModelOption[] {
+  return includeHidden ? [...models] : models.filter((model) => !model.hidden);
+}
+
+function mapModel(entry: Record<string, unknown>): ModelOption | undefined {
+  const rawModel = typeof entry.model === 'string' && entry.model.trim() ? entry.model.trim() : '';
+  const rawId = typeof entry.id === 'string' && entry.id.trim() ? entry.id.trim() : '';
+  if (!rawModel && !rawId) return undefined;
+  const model = rawModel || rawId;
+  const displayName = typeof entry.displayName === 'string' && entry.displayName.trim() ? entry.displayName.trim() : model;
+  const description = typeof entry.description === 'string' ? entry.description : '';
+  const supportedReasoningEfforts = Array.isArray(entry.supportedReasoningEfforts)
+    ? entry.supportedReasoningEfforts
+      .map((effort) => {
+        if (typeof effort === 'string') return effort;
+        if (effort && typeof effort === 'object' && typeof (effort as { reasoningEffort?: unknown }).reasoningEffort === 'string') {
+          return (effort as { reasoningEffort: string }).reasoningEffort;
+        }
+        return undefined;
+      })
+      .filter((effort): effort is string => Boolean(effort))
+    : [];
+  const defaultReasoningEffort = typeof entry.defaultReasoningEffort === 'string' && entry.defaultReasoningEffort.trim()
+    ? entry.defaultReasoningEffort.trim()
+    : null;
+  return {
+    model,
+    id: rawId || model,
+    displayName,
+    description,
+    isDefault: entry.isDefault === true,
+    hidden: entry.hidden === true,
+    supportedReasoningEfforts,
+    defaultReasoningEffort,
+  };
 }
 
 function isDesktopMetadataCompatibilityError(err: unknown): boolean {

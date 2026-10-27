@@ -106,6 +106,42 @@ export type AgentEvent =
   | { type: 'done'; sessionId?: string }
   | { type: 'error'; message: string };
 
+/** A thread's persisted model settings, read without loading the thread. */
+export interface ThreadModelState {
+  model: string | null;
+  effort: string | null;
+  loaded: boolean;
+  canAcceptDirectInput: boolean | null;
+}
+
+/** A model advertised by the agent's model catalog. */
+export interface ModelOption {
+  model: string;
+  id: string;
+  displayName: string;
+  description: string;
+  isDefault: boolean;
+  hidden: boolean;
+  supportedReasoningEfforts: string[];
+  defaultReasoningEffort: string | null;
+}
+
+export interface ListModelsOptions {
+  includeHidden?: boolean;
+  forceRefresh?: boolean;
+}
+
+/** Distinguishes an unreadable thread from one that no longer exists. */
+export class ThreadModelReadError extends Error {
+  readonly code: 'not_found' | 'read_failed';
+
+  constructor(code: 'not_found' | 'read_failed', message: string) {
+    super(message);
+    this.name = 'ThreadModelReadError';
+    this.code = code;
+  }
+}
+
 export interface AgentRunOptions {
   prompt: string;
   /** Stable client-side id for the user message that starts this turn. */
@@ -167,6 +203,10 @@ export interface AgentAdapter {
   listSessionPage?(cwd: string, cursor?: string, searchTerm?: string): Promise<import('../project/types').SessionPage>;
   listProjectRoots?(): Promise<string[]>;
   readSession?(threadId: string): Promise<import('../project/types').SessionDetail>;
+  /** Read a thread's persisted model settings without loading it. */
+  readThreadModel?(threadId: string): Promise<ThreadModelState>;
+  /** List the models this agent can use. */
+  listModels?(opts?: ListModelsOptions): Promise<ModelOption[]>;
   createSession?(cwd: string): Promise<import('../project/types').SessionSummary>;
   renameSession?(threadId: string, title: string): Promise<void>;
   archiveSession?(threadId: string): Promise<void>;

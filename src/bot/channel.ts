@@ -70,6 +70,11 @@ import { fetchFeishuTopicTitle, syncBoundTopicTitles } from '../project/topic-ti
 import { FEISHU_ASSISTANT_PROJECT_KEY } from '../project/assistant';
 import { threadTitleFromText } from './thread-title';
 
+/** OMP keeps its configured model; Codex always follows the thread's own setting. */
+export function modelOverrideForBackend(cfg: AppConfig, backend: 'omp' | 'codex'): { model?: string } {
+  return backend === 'omp' ? { model: getOmpModel(cfg) } : {};
+}
+
 const DEBOUNCE_MS = 600;
 
 // Lark SDK logs API errors at error level even when the caller catches them.
@@ -754,6 +759,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
   });
 
   let run: ReturnType<AgentAdapter['run']>;
+  const backend = getAgentBackend(controls.cfg);
   try {
     run = agent.run({
       prompt,
@@ -761,12 +767,12 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
       title,
       sessionId: resumeFrom,
       cwd,
-      model: getOmpModel(controls.cfg),
+      ...modelOverrideForBackend(controls.cfg, backend),
       imagePaths,
       stopGraceMs: getAgentStopGraceMs(controls.cfg),
       hostTools: feishuHost.tools,
       hostUriSchemes: feishuHost.uriSchemes,
-      ...(getAgentBackend(controls.cfg) === 'codex'
+      ...(backend === 'codex'
         ? { additionalContext: buildFeishuTurnContext(batch, project) }
         : {}),
     });

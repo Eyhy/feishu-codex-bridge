@@ -180,6 +180,7 @@ Bridge 默认不会把 `chat_id`、`sender_id`、`thread_id` 拼进可见 prompt
 ### 使用设备上的 Codex 配置
 
 Bridge 默认不会设置模型、代理、provider 或 service tier，而是让 Codex app-server 使用本机登录状态和配置。
+Codex 话题始终沿用该 Codex 线程自己的模型与推理强度；配置里的 `preferences.ompModel` / `codexModel` 只用于 OMP 后端，不会覆盖 Codex 线程。
 
 macOS 上，未显式配置二进制时会优先使用 ChatGPT 桌面应用自带的 Codex runtime，避免系统 PATH 中的旧 CLI 无法解析桌面端模型缓存：
 

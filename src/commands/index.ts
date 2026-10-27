@@ -28,6 +28,7 @@ import {
   welcomeCard,
   workspacesCard,
 } from '../card/templates';
+import type { StatusModelInfo } from '../card/templates';
 import type { AppConfig, MessageReplyMode, TenantBrand } from '../config/schema';
 import {
   getAgentStopGraceMs,
@@ -884,10 +885,41 @@ async function handleWsRemove(name: string, ctx: CommandContext): Promise<void> 
   await reply(ctx, `✓ 已删除工作空间：\`${name}\``);
 }
 
+async function readStatusModel(ctx: CommandContext, threadId?: string): Promise<StatusModelInfo | undefined> {
+  if (ctx.agent.id !== 'codex' || !ctx.agent.readThreadModel) return undefined;
+  if (!threadId) return {};
+  try {
+    const state = await ctx.agent.readThreadModel(threadId);
+    if (!state.model) return { readFailed: true };
+    const modelId = state.model;
+    let displayName = modelId;
+    if (ctx.agent.listModels) {
+      try {
+        const models = await ctx.agent.listModels({ includeHidden: true });
+        const match = models.find((model) => model.model === modelId || model.id === modelId);
+        if (match?.displayName) displayName = match.displayName;
+      } catch (err) {
+        log.warn('commands', 'status-model-list-failed', {
+          threadId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+    return { displayName, effort: state.effort ?? undefined };
+  } catch (err) {
+    log.warn('commands', 'status-model-read-failed', {
+      threadId,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return { readFailed: true };
+  }
+}
+
 async function handleStatus(_args: string, ctx: CommandContext): Promise<void> {
   const project = ctx.projectBindings?.findProjectByChat(ctx.msg.chatId);
   if (project) {
     const topic = ctx.msg.threadId ? ctx.projectBindings?.findTopic(ctx.msg.chatId, ctx.msg.threadId) : undefined;
+    const model = await readStatusModel(ctx, topic?.codexThreadId);
     await sendCommandCard(ctx, statusCard({
         cwd: project.cwd,
         sessionId: topic?.codexThreadId,
@@ -898,11 +930,13 @@ async function handleStatus(_args: string, ctx: CommandContext): Promise<void> {
         projectName: project.name,
         sessionTitle: topic ? '已绑定会话' : undefined,
         hideInternalIds: true,
+        model,
       }));
     return;
   }
   const cwd = ctx.workspaces.cwdFor(ctx.scope) ?? homedir();
   const sess = ctx.sessions.getRaw(ctx.scope);
+  const model = await readStatusModel(ctx, sess?.sessionId);
   const card = statusCard({
     cwd,
     sessionId: sess?.sessionId,
@@ -910,6 +944,7 @@ async function handleStatus(_args: string, ctx: CommandContext): Promise<void> {
     agentName: ctx.agent.displayName,
     scope: ctx.scope,
     chatMode: ctx.chatMode,
+    model,
   });
   await sendCommandCard(ctx, card);
 }

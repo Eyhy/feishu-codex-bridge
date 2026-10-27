@@ -1,7 +1,8 @@
 import type { NormalizedMessage } from '@larksuiteoapi/node-sdk';
 import { describe, expect, it } from 'vitest';
 import type { LocalAttachment } from '../media/cache';
-import { buildPrompt, deriveThreadTitle } from './channel';
+import { buildPrompt, deriveThreadTitle, modelOverrideForBackend } from './channel';
+import type { AppConfig } from '../config/schema';
 import type { QuotedContext } from './quote';
 
 function message(content: string, resources: NormalizedMessage['resources'] = []): NormalizedMessage {
@@ -56,6 +57,12 @@ describe('Codex prompt presentation', () => {
   it('derives a compact user-facing title from the actual message', () => {
     expect(deriveThreadTitle([message('  如何   优化飞书 Codex 会话  ')])).toBe('如何 优化飞书 Codex 会话');
     expect(Array.from(deriveThreadTitle([message('很长的标题'.repeat(20))])).length).toBeLessThanOrEqual(48);
+  });
+
+  it('passes a model override only for the OMP backend', () => {
+    const cfg = { preferences: { ompModel: 'omp-fast' } } as AppConfig;
+    expect(modelOverrideForBackend(cfg, 'codex')).toEqual({});
+    expect(modelOverrideForBackend(cfg, 'omp')).toEqual({ model: 'omp-fast' });
   });
 
   it('uses an attachment title without exposing the internal file key', () => {

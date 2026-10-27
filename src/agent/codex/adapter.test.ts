@@ -1,18 +1,21 @@
-import { chmod, mkdtemp, writeFile } from 'node:fs/promises';
+import { chmod, mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { CodexAdapter } from './adapter';
+import { ThreadModelReadError } from '../types';
 import type { AgentEvent } from '../types';
 
 async function fakeCodex(options: { rejectDesktopMetadata?: boolean; rejectAdditionalContext?: boolean; interaction?: 'questions' | 'approval' } = {}): Promise<string> {
   const dir = await mkdtemp(join(tmpdir(), 'codex-adapter-test-'));
   const path = join(dir, 'codex-fake.mjs');
   await writeFile(path, `#!/usr/bin/env node
+import { appendFileSync } from 'node:fs';
 import { createInterface } from 'node:readline';
 if (process.argv.includes('--version')) { console.log('codex-cli test'); process.exit(0); }
 const rl = createInterface({ input: process.stdin, crlfDelay: Infinity });
 const send = (value) => console.log(JSON.stringify(value));
+const requestLog = ${JSON.stringify(join(dir, 'requests.jsonl'))};
 const rejectDesktopMetadata = ${JSON.stringify(Boolean(options.rejectDesktopMetadata))};
 const rejectAdditionalContext = ${JSON.stringify(Boolean(options.rejectAdditionalContext))};
 const interaction = ${JSON.stringify(options.interaction ?? '')};
@@ -20,9 +23,14 @@ let activeThreadId = 'thread-new';
 let activeThreadName = '';
 for await (const line of rl) {
   const msg = JSON.parse(line);
+  if (msg.method) appendFileSync(requestLog, JSON.stringify({ method: msg.method, params: msg.params }) + '\\n');
   if (msg.method === 'initialize') send({ id: msg.id, result: {} });
   if (msg.method === 'thread/list') send({ id: msg.id, result: { data: [{ id: 'thread-existing', name: msg.params.searchTerm ? '匹配会话' : activeThreadName || '旧会话', preview: '修复卡片', cwd: '/tmp/project', updatedAt: 10, status: { type: 'idle' } }], nextCursor: msg.params.cursor ? null : 'cursor-2', backwardsCursor: null } });
-  if (msg.method === 'model/list') send({ id: msg.id, result: { data: [{ model: 'gpt-5.6-sol', isDefault: true }] } });
+  if (msg.method === 'model/list') send({ id: msg.id, result: { data: [
+    { id: 'gpt-5.6-sol', model: 'gpt-5.6-sol', displayName: 'Sol', description: '默认模型', hidden: false, isDefault: true, defaultReasoningEffort: 'high', supportedReasoningEfforts: [{ description: '低', reasoningEffort: 'low' }, { description: '高', reasoningEffort: 'high' }] },
+    { id: 'gpt-6-astra', model: 'gpt-6-astra', displayName: 'Astra', description: '实验模型', hidden: false, isDefault: false, defaultReasoningEffort: 'medium', supportedReasoningEfforts: [{ description: '中', reasoningEffort: 'medium' }, { description: '最高', reasoningEffort: 'ultra' }] },
+    { id: 'hidden-model', model: 'hidden-model', displayName: 'Hidden', description: '', hidden: true, isDefault: false, defaultReasoningEffort: 'low', supportedReasoningEfforts: [] },
+  ] } });
   if (msg.method === 'thread/start') {
     if (rejectDesktopMetadata && msg.params.threadSource) {
       send({ id: msg.id, error: { code: -32602, message: 'unknown field threadSource' } });
@@ -42,8 +50,9 @@ for await (const line of rl) {
     else { activeThreadId = msg.params.threadId; send({ id: msg.id, result: { thread: { id: msg.params.threadId, cwd: '/tmp/project' } } }); }
   }
   if (msg.method === 'thread/read') {
-    if (msg.params.threadId === 'unloaded') send({ id: msg.id, error: { code: -32000, message: 'thread not loaded: unloaded' } });
-    else send({ id: msg.id, result: { thread: { id: msg.params.threadId, sessionId: 'session-1', name: '详情会话', preview: '查看详情', cwd: '/tmp/project', updatedAt: 20, status: { type: 'active', activeFlags: ['waitingOnUserInput'] }, source: 'vscode', turns: [{ items: [{ type: 'userMessage', content: [{ type: 'text', text: '请查看', text_elements: [] }] }, { type: 'agentMessage', text: '正在查看' }, { type: 'commandExecution', command: 'pnpm test' }] }] } } });
+    if (msg.params.threadId === 'missing-thread') send({ id: msg.id, error: { code: -32000, message: 'thread not found: missing-thread' } });
+    else if (msg.params.threadId === 'unloaded') send({ id: msg.id, error: { code: -32000, message: 'thread not loaded: unloaded' } });
+    else send({ id: msg.id, result: { thread: { id: msg.params.threadId, sessionId: 'session-1', name: '详情会话', preview: '查看详情', cwd: '/tmp/project', updatedAt: 20, status: { type: 'active', activeFlags: ['waitingOnUserInput'] }, source: 'vscode', model: 'gpt-5.6-sol', reasoningEffort: 'high', canAcceptDirectInput: true, turns: [{ items: [{ type: 'userMessage', content: [{ type: 'text', text: '请查看', text_elements: [] }] }, { type: 'agentMessage', text: '正在查看' }, { type: 'commandExecution', command: 'pnpm test' }] }] } } });
   }
   if (msg.method === 'thread/name/set') {
     activeThreadName = msg.params.name;
@@ -95,6 +104,11 @@ for await (const line of rl) {
 `, 'utf8');
   await chmod(path, 0o700);
   return path;
+}
+
+async function readRequests(binary: string): Promise<Array<{ method: string; params?: Record<string, unknown> }>> {
+  const text = await readFile(join(dirname(binary), 'requests.jsonl'), 'utf8');
+  return text.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
 }
 
 async function collect(events: AsyncIterable<AgentEvent>): Promise<AgentEvent[]> {
@@ -198,7 +212,7 @@ describe('CodexAdapter', () => {
     const adapter = new CodexAdapter({ binary: await fakeCodex() });
     const run = adapter.run({ prompt: '请测试', cwd: '/tmp/project' });
     await expect(collect(run.events)).resolves.toEqual([
-      { type: 'system', sessionId: 'thread-new', cwd: '/tmp/project', model: undefined },
+      { type: 'system', sessionId: 'thread-new', cwd: '/tmp/project' },
       { type: 'text', delta: '完成' },
       { type: 'done', sessionId: 'thread-new' },
     ]);
@@ -224,7 +238,7 @@ describe('CodexAdapter', () => {
       cwd: '/tmp/project',
     });
     await expect(collect(run.events)).resolves.toEqual([
-      { type: 'system', sessionId: 'thread-new', cwd: '/tmp/project', model: undefined },
+      { type: 'system', sessionId: 'thread-new', cwd: '/tmp/project' },
       { type: 'text', delta: '兼容完成' },
       { type: 'done', sessionId: 'thread-new' },
     ]);
@@ -281,18 +295,18 @@ describe('CodexAdapter', () => {
     const run = adapter.run({ prompt: '继续处理', sessionId: 'missing-rollout', cwd: '/tmp/project' });
     await expect(collect(run.events)).resolves.toEqual([
       { type: 'ui_notice', message: '原 Codex 会话没有可恢复的执行记录，已自动新建会话。', level: 'warning' },
-      { type: 'system', sessionId: 'thread-new', cwd: '/tmp/project', model: 'gpt-5.6-sol' },
+      { type: 'system', sessionId: 'thread-new', cwd: '/tmp/project' },
       { type: 'text', delta: '完成' },
       { type: 'done', sessionId: 'thread-new' },
     ]);
     await adapter.close();
   });
 
-  it('resumes historical threads with the current app-server default model', async () => {
+  it('resumes historical threads without injecting a model', async () => {
     const adapter = new CodexAdapter({ binary: await fakeCodex() });
     const run = adapter.run({ prompt: '继续处理', sessionId: 'thread-existing', cwd: '/tmp/project' });
     await expect(collect(run.events)).resolves.toEqual([
-      { type: 'system', sessionId: 'thread-existing', cwd: '/tmp/project', model: 'gpt-5.6-sol' },
+      { type: 'system', sessionId: 'thread-existing', cwd: '/tmp/project' },
       { type: 'text', delta: '完成' },
       { type: 'done', sessionId: 'thread-existing' },
     ]);
@@ -303,12 +317,67 @@ describe('CodexAdapter', () => {
     const adapter = new CodexAdapter({ binary: await fakeCodex() });
     const run = adapter.run({ prompt: '继续处理', sessionId: 'legacy-compact', cwd: '/tmp/project' });
     await expect(collect(run.events)).resolves.toEqual([
-      { type: 'system', sessionId: 'legacy-compact', cwd: '/tmp/project', model: 'gpt-5.6-sol' },
+      { type: 'system', sessionId: 'legacy-compact', cwd: '/tmp/project' },
       { type: 'ui_notice', message: '原 Codex 会话使用了当前设备不兼容的配置，已自动新建会话并重试。', level: 'warning' },
       { type: 'system', sessionId: 'thread-new', cwd: '/tmp/project' },
       { type: 'text', delta: '完成' },
       { type: 'done', sessionId: 'thread-new' },
     ]);
+    await adapter.close();
+  });
+
+  it('ignores a caller-supplied model on every turn', async () => {
+    const binary = await fakeCodex();
+    const adapter = new CodexAdapter({ binary });
+    const events = await collect(adapter.run({
+      prompt: '继续处理',
+      sessionId: 'thread-existing',
+      model: 'should-not-be-used',
+      cwd: '/tmp/project',
+    }).events);
+    expect(events.find((event) => event.type === 'system')).not.toHaveProperty('model');
+    const requests = await readRequests(binary);
+    const turnStart = requests.find((request) => request.method === 'turn/start');
+    expect(turnStart).toBeDefined();
+    expect(turnStart?.params).not.toHaveProperty('model');
+    expect(requests.some((request) => request.method === 'model/list')).toBe(false);
+    await adapter.close();
+  });
+
+  it('reads thread model state without resuming the thread', async () => {
+    const binary = await fakeCodex();
+    const adapter = new CodexAdapter({ binary });
+    await expect(adapter.readThreadModel('thread-existing')).resolves.toEqual({
+      model: 'gpt-5.6-sol',
+      effort: 'high',
+      loaded: true,
+      canAcceptDirectInput: true,
+    });
+    const requests = await readRequests(binary);
+    expect(requests.some((request) => request.method === 'thread/resume')).toBe(false);
+    expect(requests.some((request) => request.method === 'thread/read' && request.params?.includeTurns)).toBe(false);
+    await expect(adapter.readThreadModel('missing-thread')).rejects.toBeInstanceOf(ThreadModelReadError);
+    await adapter.close();
+  });
+
+  it('lists models with hidden filtering and normalized reasoning efforts', async () => {
+    const adapter = new CodexAdapter({ binary: await fakeCodex() });
+    await expect(adapter.listModels()).resolves.toEqual([
+      expect.objectContaining({
+        model: 'gpt-5.6-sol',
+        displayName: 'Sol',
+        isDefault: true,
+        supportedReasoningEfforts: ['low', 'high'],
+      }),
+      expect.objectContaining({
+        model: 'gpt-6-astra',
+        displayName: 'Astra',
+        supportedReasoningEfforts: ['medium', 'ultra'],
+      }),
+    ]);
+    await expect(adapter.listModels({ includeHidden: true })).resolves.toEqual(
+      expect.arrayContaining([expect.objectContaining({ model: 'hidden-model', hidden: true })]),
+    );
     await adapter.close();
   });
 });

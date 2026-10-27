@@ -430,20 +430,63 @@ export interface StatusInfo {
   projectName?: string;
   sessionTitle?: string;
   hideInternalIds?: boolean;
+  /** Present only for Codex; OMP omits the model line entirely. */
+  model?: StatusModelInfo;
+}
+
+export interface StatusModelInfo {
+  displayName?: string;
+  effort?: string;
+  readFailed?: boolean;
+  pendingDisplayName?: string;
+}
+
+function effortLabel(effort: string): string {
+  switch (effort) {
+    case 'low': return '低';
+    case 'medium': return '中';
+    case 'high': return '高';
+    case 'xhigh': return '极高';
+    case 'ultra': return '最高';
+    default: return effort;
+  }
+}
+
+function modelStatusLine(model: StatusModelInfo): string {
+  if (model.readFailed) {
+    const unknown = '模型：未知（点刷新重试）';
+    return model.pendingDisplayName ? `${unknown}\n待生效：${escapeMd(model.pendingDisplayName)}` : unknown;
+  }
+  if (!model.displayName) {
+    return model.pendingDisplayName
+      ? `模型：${escapeMd(model.pendingDisplayName)}（待生效）`
+      : '模型：尚未开始（发送第一条消息后才有会话模型）';
+  }
+  if (model.pendingDisplayName) {
+    return `模型：${escapeMd(model.displayName)}（待生效：${escapeMd(model.pendingDisplayName)}）`;
+  }
+  const strength = model.effort ? ` · 强度：${escapeMd(effortLabel(model.effort))}` : '';
+  return `模型：${escapeMd(model.displayName)}${strength}`;
 }
 
 export function statusCard(info: StatusInfo): object {
+  const modelLine = info.model ? modelStatusLine(info.model) : '';
+  const refreshAction = info.model?.readFailed
+    ? [{ text: '刷新', value: { cmd: 'status' } }]
+    : [];
   if (info.hideInternalIds) {
     return shell('当前状态', [
       divMd([
         info.projectName ? `项目：**${escapeMd(info.projectName)}**` : '',
         `工作目录：\`${escapeCode(info.cwd)}\``,
         info.sessionTitle ? `当前会话：**${escapeMd(info.sessionTitle)}**` : '当前会话：尚未绑定',
+        modelLine,
         `助手：${escapeMd(info.agentName)}`,
       ].filter(Boolean).join('\n')),
       HR,
       actions([
         { text: '查看会话', value: { cmd: 'sessions' }, style: 'primary' },
+        ...refreshAction,
         { text: '使用帮助', value: { cmd: 'help' } },
       ]),
     ]);
@@ -461,13 +504,15 @@ export function statusCard(info: StatusInfo): object {
     `范围：${scopeLine}`,
     `工作目录：\`${escapeCode(info.cwd)}\``,
     `会话：${sessionLine}`,
+    modelLine,
     `助手：${escapeMd(info.agentName)}`,
-  ];
+  ].filter(Boolean);
   return shell('当前状态', [
     divMd(lines.join('\n')),
     HR,
     actions([
       { text: '新会话', value: { cmd: 'new' }, style: 'primary' },
+      ...refreshAction,
       { text: '工作空间', value: { cmd: 'ws.list' } },
       { text: '使用帮助', value: { cmd: 'help' } },
     ]),

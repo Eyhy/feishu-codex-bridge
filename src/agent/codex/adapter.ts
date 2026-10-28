@@ -1,4 +1,5 @@
-import type { AgentAdapter, AgentAdditionalContext, AgentEvent, AgentRun, AgentRunOptions, AgentUiResponse } from '../types';
+import type { AgentAdapter, AgentAdditionalContext, AgentEvent, AgentRun, AgentRunOptions, AgentUiResponse, ListModelsOptions, ModelChoice, ModelCopyResult, ModelOption, ModelSwitchResult, ThreadModelState } from '../types';
+import { FORK_MODEL_COPY_FAILED_MESSAGE, ThreadModelReadError } from '../types';
 import { log } from '../../core/logger';
 import { CodexAppServerClient, type JsonRpcNotification, type JsonRpcServerRequest } from './app-server';
 import type { SessionActivity, SessionDetail, SessionPage, SessionSummary } from '../../project/types';
@@ -48,17 +49,27 @@ export interface CodexAdapterOptions {
 
 interface ThreadResponse {
   id?: string;
+  model?: unknown;
+  reasoningEffort?: unknown;
   thread?: Record<string, unknown> & { id?: string };
 }
 
 const BRIDGE_SERVICE_NAME = 'feishu_codex_bridge';
+const WRITER_RELEASE_GRACE_MS = 1_000;
+
+export const CODEX_ACTIVE_WRITER_MESSAGE = '桌面端正在使用这个会话，请在桌面端关闭该会话后重试';
 
 export class CodexAdapter implements AgentAdapter {
   readonly id = 'codex';
   readonly displayName = 'Codex';
   private readonly client: CodexAppServerClient;
-  private defaultModel?: string;
-  private defaultModelPromise?: Promise<string | undefined>;
+  private modelCache?: { models: ModelOption[]; expiresAt: number };
+  private modelCachePromise?: Promise<ModelOption[]>;
+  private activeOperations = 0;
+  private releaseTimer?: NodeJS.Timeout;
+  private releaseResolve?: () => void;
+  private releasePromise?: Promise<void>;
+  private releaseRequested = false;
 
   constructor(opts: CodexAdapterOptions = {}) {
     this.client = new CodexAppServerClient(opts.binary);
@@ -69,34 +80,237 @@ export class CodexAdapter implements AgentAdapter {
   }
 
   async close(): Promise<void> {
+    this.releaseRequested = false;
+    this.cancelPendingRelease();
     await this.client.close();
   }
 
   /**
-   * Historical threads retain the model they were created with.  Resolve the
-   * current app-server default before resuming one so an old/incompatible
-   * model does not keep breaking an otherwise healthy device configuration.
+   * Give a completed turn/model operation a short grace period, then close the
+   * app-server so another Codex process can take the thread writer. A new
+   * operation during the grace cancels the timer but keeps the release intent,
+   * which is rescheduled once that operation finishes. The next request after
+   * a release restarts the app-server through ensureStarted().
    */
-  private async resolveDefaultModel(): Promise<string | undefined> {
-    if (this.defaultModel) return this.defaultModel;
-    if (!this.defaultModelPromise) {
-      this.defaultModelPromise = this.client.request<{
-        data?: Array<{ model?: unknown; isDefault?: unknown }>;
-      }>('model/list', {}).then((response) => {
-        const model = response.data?.find((entry) => entry.isDefault === true && typeof entry.model === 'string')?.model;
-        if (typeof model === 'string' && model.trim()) {
-          this.defaultModel = model.trim();
-          return this.defaultModel;
+  releaseWriterIfIdle(): Promise<void> {
+    this.releaseRequested = true;
+    return this.ensureReleaseScheduled();
+  }
+
+  private ensureReleaseScheduled(): Promise<void> {
+    if (!this.releaseRequested) return Promise.resolve();
+    if (this.releasePromise) return this.releasePromise;
+    this.releasePromise = new Promise<void>((resolve) => {
+      this.releaseResolve = resolve;
+      this.releaseTimer = setTimeout(() => {
+        this.releaseTimer = undefined;
+        if (this.activeOperations > 0) {
+          this.finishRelease();
+          return;
         }
-        return undefined;
-      }).catch((err) => {
-        log.warn('codex', 'default-model-unavailable', { error: err instanceof Error ? err.message : String(err) });
-        return undefined;
-      }).finally(() => {
-        this.defaultModelPromise = undefined;
-      });
+        this.releaseRequested = false;
+        void this.client.close()
+          .catch((err) => {
+            log.warn('codex', 'writer-release-failed', {
+              error: err instanceof Error ? err.message : String(err),
+            });
+          })
+          .finally(() => this.finishRelease());
+      }, WRITER_RELEASE_GRACE_MS);
+    });
+    return this.releasePromise;
+  }
+
+  private beginOperation(): void {
+    this.activeOperations += 1;
+    // A new operation takes priority over a pending release, but the release
+    // intent survives so the writer is freed once this operation finishes.
+    if (this.releaseTimer) clearTimeout(this.releaseTimer);
+    this.releaseTimer = undefined;
+    this.finishRelease();
+  }
+
+  private endOperation(): void {
+    this.activeOperations = Math.max(0, this.activeOperations - 1);
+    if (this.activeOperations === 0 && this.releaseRequested) {
+      void this.ensureReleaseScheduled();
     }
-    return this.defaultModelPromise;
+  }
+
+  private cancelPendingRelease(): void {
+    if (this.releaseTimer) clearTimeout(this.releaseTimer);
+    this.releaseTimer = undefined;
+    this.finishRelease();
+  }
+
+  private finishRelease(): void {
+    const resolve = this.releaseResolve;
+    this.releaseResolve = undefined;
+    this.releasePromise = undefined;
+    resolve?.();
+  }
+
+  async listModels(opts: ListModelsOptions = {}): Promise<ModelOption[]> {
+    const cacheFresh = this.modelCache !== undefined && this.modelCache.expiresAt > Date.now();
+    if (!opts.forceRefresh && cacheFresh) return filterModels(this.modelCache!.models, opts.includeHidden);
+    if (!this.modelCachePromise) {
+      const pending = this.fetchModels().then((models) => {
+        this.modelCache = { models, expiresAt: Date.now() + 60_000 };
+        return models;
+      }).finally(() => {
+        if (this.modelCachePromise === pending) this.modelCachePromise = undefined;
+      });
+      this.modelCachePromise = pending;
+    }
+    const models = await this.modelCachePromise;
+    return filterModels(models, opts.includeHidden);
+  }
+
+  private async fetchModels(): Promise<ModelOption[]> {
+    this.beginOperation();
+    try {
+      const models: ModelOption[] = [];
+      let cursor: string | undefined;
+      do {
+        const response = await this.client.request<{
+          data?: Array<Record<string, unknown>>;
+          nextCursor?: string | null;
+        }>('model/list', {
+          includeHidden: true,
+          ...(cursor ? { cursor } : {}),
+        });
+        for (const entry of response.data ?? []) {
+          const mapped = mapModel(entry);
+          if (mapped) models.push(mapped);
+        }
+        cursor = response.nextCursor ?? undefined;
+      } while (cursor);
+      return models;
+    } finally {
+      this.endOperation();
+    }
+  }
+
+  async readThreadModel(threadId: string): Promise<ThreadModelState> {
+    this.beginOperation();
+    try {
+      let response: { thread?: Record<string, unknown> };
+      try {
+        response = await this.client.request('thread/read', { threadId });
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        if (isThreadNotFoundError(err)) throw new ThreadModelReadError('not_found', message);
+        throw new ThreadModelReadError('read_failed', message);
+      }
+      const thread = response.thread;
+      if (!thread) throw new ThreadModelReadError('read_failed', 'Codex app-server did not return the thread');
+      const model = typeof thread.model === 'string' && thread.model.trim() ? thread.model.trim() : null;
+      const effort = typeof thread.reasoningEffort === 'string' && thread.reasoningEffort.trim() ? thread.reasoningEffort.trim() : null;
+      const canAcceptDirectInput = typeof thread.canAcceptDirectInput === 'boolean' ? thread.canAcceptDirectInput : null;
+      return { model, effort, canAcceptDirectInput, loaded: canAcceptDirectInput !== null };
+    } finally {
+      this.endOperation();
+    }
+  }
+
+  async switchThreadModel(threadId: string, choice: ModelChoice): Promise<ModelSwitchResult> {
+    this.beginOperation();
+    try {
+      let state: ThreadModelState;
+      try {
+        state = await this.readThreadModel(threadId);
+      } catch (err) {
+        return { status: 'failed', message: errorMessage(err) };
+      }
+      const previous = { model: state.model, effort: state.effort };
+      if (!state.loaded) {
+        try {
+          await this.client.request('thread/resume', { threadId });
+        } catch (err) {
+          return {
+            status: isActiveWriterError(err) ? 'active_writer' : 'failed',
+            previous,
+            message: isActiveWriterError(err) ? CODEX_ACTIVE_WRITER_MESSAGE : errorMessage(err),
+          };
+        }
+      }
+      try {
+        await this.client.request('thread/settings/update', {
+          threadId,
+          model: choice.model,
+          effort: choice.effort,
+        });
+      } catch (err) {
+        return {
+          status: isActiveWriterError(err) ? 'active_writer' : 'failed',
+          previous,
+          message: isActiveWriterError(err) ? CODEX_ACTIVE_WRITER_MESSAGE : errorMessage(err),
+        };
+      }
+      let after: ThreadModelState;
+      try {
+        after = await this.readThreadModel(threadId);
+      } catch (err) {
+        return {
+          status: 'unconfirmed',
+          previous,
+          next: choice,
+          message: errorMessage(err),
+        };
+      }
+      if (after.model !== choice.model || after.effort !== choice.effort) {
+        return {
+          status: 'failed',
+          previous,
+          next: choice,
+          message: '模型设置已提交，但回读结果与选择不一致',
+        };
+      }
+      return { status: 'applied', previous, next: choice };
+    } finally {
+      this.endOperation();
+    }
+  }
+
+  async copyThreadModel(sourceThreadId: string, targetThreadId: string): Promise<ModelCopyResult> {
+    this.beginOperation();
+    const failed = (step: string, details: Record<string, unknown> = {}): ModelCopyResult => {
+      log.warn('codex', step, { sourceThreadId, targetThreadId, ...details });
+      return { status: 'failed', message: FORK_MODEL_COPY_FAILED_MESSAGE };
+    };
+    try {
+      let source: ThreadModelState;
+      try {
+        source = await this.readThreadModel(sourceThreadId);
+      } catch (err) {
+        return failed('copy-model-source-read-failed', { error: errorMessage(err) });
+      }
+      if (!source.model || !source.effort) return { status: 'skipped' };
+      try {
+        await this.client.request('thread/settings/update', {
+          threadId: targetThreadId,
+          model: source.model,
+          effort: source.effort,
+        });
+      } catch (err) {
+        return failed('copy-model-target-write-failed', { error: errorMessage(err) });
+      }
+      let after: ThreadModelState;
+      try {
+        after = await this.readThreadModel(targetThreadId);
+      } catch (err) {
+        return failed('copy-model-target-read-failed', { error: errorMessage(err) });
+      }
+      if (after.model !== source.model || after.effort !== source.effort) {
+        return failed('copy-model-read-back-mismatch', {
+          expected: { model: source.model, effort: source.effort },
+          actual: { model: after.model, effort: after.effort },
+        });
+      }
+      return { status: 'applied' };
+    } finally {
+      this.endOperation();
+    }
   }
 
   async listSessions(cwd: string): Promise<SessionSummary[]> {
@@ -295,13 +509,13 @@ export class CodexAdapter implements AgentAdapter {
   }
 
   run(opts: AgentRunOptions): AgentRun {
+    this.beginOperation();
     const client = this.client;
     const requestTurn = this.requestTurn.bind(this);
     const queue = new AsyncQueue<AgentEvent>();
     const pendingUi = new Map<string, PendingUi>();
     let threadId: string | undefined;
     let turnId: string | undefined;
-    let effectiveModel: string | undefined;
     let replacementStarted = false;
     let stopped = false;
     let settled = false;
@@ -313,6 +527,7 @@ export class CodexAdapter implements AgentAdapter {
     const finish = (): void => {
       if (settled) return;
       settled = true;
+      this.endOperation();
       unsubscribe?.();
       unsubscribeRequests?.();
       queue.close();
@@ -547,47 +762,240 @@ export class CodexAdapter implements AgentAdapter {
       });
     };
 
+    const pendingChoice: ModelChoice | undefined =
+      opts.pendingModel && opts.pendingEffort
+        ? { model: opts.pendingModel, effort: opts.pendingEffort }
+        : undefined;
+
+    const modelLabel = async (modelId: string): Promise<string> => {
+      try {
+        const models = await this.listModels({ includeHidden: true });
+        return models.find((model) => model.model === modelId || model.id === modelId)?.displayName ?? modelId;
+      } catch {
+        return modelId;
+      }
+    };
+
+    const emitPendingFailure = (
+      status: 'failed' | 'active_writer' | 'validation_failed',
+      message: string,
+    ): void => {
+      queue.push({ type: 'model_switch', status, next: pendingChoice, message });
+      queue.push({ type: 'error', message });
+      finish();
+    };
+
+    const validateModelChoice = async (
+      choice: { model: string; effort?: string | null },
+    ): Promise<{
+      kind: 'ok' | 'skip' | 'empty' | 'model_missing' | 'effort_missing';
+      model?: ModelOption;
+    }> => {
+      let models: ModelOption[];
+      try {
+        models = await this.listModels({ includeHidden: true });
+      } catch {
+        return { kind: 'skip' };
+      }
+      if (models.length === 0) return { kind: 'empty' };
+      const check = (list: ModelOption[]): { kind: 'ok' | 'model_missing' | 'effort_missing'; model?: ModelOption } => {
+        const model = list.find((item) => item.model === choice.model || item.id === choice.model);
+        if (!model) return { kind: 'model_missing' };
+        if (choice.effort && !model.supportedReasoningEfforts.includes(choice.effort)) {
+          return { kind: 'effort_missing', model };
+        }
+        return { kind: 'ok', model };
+      };
+      const first = check(models);
+      if (first.kind === 'ok') return first;
+      try {
+        models = await this.listModels({ includeHidden: true, forceRefresh: true });
+      } catch {
+        return { kind: 'skip' };
+      }
+      if (models.length === 0) return { kind: 'empty' };
+      return check(models);
+    };
+
+    const checkPending = async (): Promise<boolean> => {
+      if (!pendingChoice) return true;
+      const validation = await validateModelChoice(pendingChoice);
+      if (validation.kind === 'skip') return true;
+      if (validation.kind === 'empty') {
+        emitPendingFailure('validation_failed', '模型列表暂时为空，无法应用待生效模型，请稍后重试。');
+        return false;
+      }
+      if (validation.kind === 'model_missing') {
+        emitPendingFailure(
+          'failed',
+          `待生效的模型 ${pendingChoice.model} 在这台设备上不可用。请重新选择模型。`,
+        );
+        return false;
+      }
+      if (validation.kind === 'effort_missing') {
+        emitPendingFailure(
+          'failed',
+          `待生效的模型 ${pendingChoice.model} 不支持强度 ${pendingChoice.effort}。请重新选择。`,
+        );
+        return false;
+      }
+      return true;
+    };
+
+    const rejectThreadModel = (message: string): false => {
+      queue.push({ type: 'error', message });
+      finish();
+      return false;
+    };
+
+    const checkThreadModel = async (
+      model: string | null | undefined,
+      effort: string | null | undefined,
+    ): Promise<boolean> => {
+      if (!model) return true;
+      const validation = await validateModelChoice({ model, effort });
+      if (validation.kind === 'skip' || validation.kind === 'empty') return true;
+      if (validation.kind === 'model_missing') {
+        return rejectThreadModel(
+          `当前会话的模型 ${model} 在这台设备上不可用。请用 /model 重新选择模型，或 /new 新建会话。`,
+        );
+      }
+      if (validation.kind === 'effort_missing') {
+        return rejectThreadModel(
+          `模型 ${model} 不支持强度 ${effort}。请用 /model 重新选择，或 /new 新建会话。`,
+        );
+      }
+      return true;
+    };
+
     const start = async (): Promise<void> => {
       try {
         await this.client.ensureStarted();
         unsubscribe = this.client.onNotification(handleNotification);
         unsubscribeRequests = this.client.onServerRequest(handleServerRequest);
-        effectiveModel = opts.model ?? (opts.sessionId ? await this.resolveDefaultModel() : undefined);
-        if (opts.sessionId) log.info('codex', 'resolved-model', { sessionId: opts.sessionId, model: effectiveModel ?? null });
         let thread: ThreadResponse;
+        let resumed = false;
         if (opts.sessionId) {
           try {
             thread = await client.request('thread/resume', {
               threadId: opts.sessionId,
               ...(opts.cwd ? { cwd: opts.cwd } : {}),
-          });
+            });
+            resumed = true;
           } catch (err) {
+            if (isActiveWriterError(err) && pendingChoice) {
+              emitPendingFailure('active_writer', CODEX_ACTIVE_WRITER_MESSAGE);
+              return;
+            }
             if (!isMissingRolloutError(err)) throw err;
+            if (!(await checkPending())) return;
             queue.push({ type: 'ui_notice', message: '原 Codex 会话没有可恢复的执行记录，已自动新建会话。', level: 'warning' });
             thread = await this.startThread(opts.cwd);
           }
         } else {
+          if (!(await checkPending())) return;
           thread = await this.startThread(opts.cwd);
         }
         threadId = thread.thread?.id ?? thread.id ?? opts.sessionId;
         if (!threadId) throw new Error('Codex app-server did not return a thread id');
+        // A newly started thread has no earlier user choice to report; its
+        // device default is not a previous model.
+        const previous = resumed ? readThreadModelSettings(thread) : undefined;
+        if (resumed && pendingChoice && !(await checkPending())) return;
+        if (resumed && !pendingChoice && !(await checkThreadModel(previous?.model, previous?.effort))) return;
         const currentName = typeof thread.thread?.name === 'string' ? thread.thread.name : undefined;
         const requestedName = opts.title?.replace(/\s+/g, ' ').trim();
         if (requestedName && currentName !== requestedName) {
           await this.setThreadName(threadId, requestedName);
         }
-        queue.push({ type: 'system', sessionId: threadId, cwd: opts.cwd, model: effectiveModel });
+        queue.push({ type: 'system', sessionId: threadId, cwd: opts.cwd });
+        if (pendingChoice) {
+          let writeOk = true;
+          try {
+            await client.request('thread/settings/update', {
+              threadId,
+              model: pendingChoice.model,
+              effort: pendingChoice.effort,
+            });
+          } catch (err) {
+            if (isActiveWriterError(err)) {
+              emitPendingFailure('active_writer', CODEX_ACTIVE_WRITER_MESSAGE);
+              return;
+            }
+            writeOk = false;
+            const message = errorMessage(err);
+            if (resumed) {
+              queue.push({ type: 'model_switch', status: 'failed', next: pendingChoice, message });
+              queue.push({ type: 'ui_notice', message, level: 'warning' });
+            } else {
+              emitPendingFailure('failed', message);
+              return;
+            }
+          }
+          if (writeOk) {
+            let after: ThreadModelState | undefined;
+            let readError: unknown;
+            for (let attempt = 0; attempt < 2 && !after; attempt += 1) {
+              try {
+                after = await this.readThreadModel(threadId);
+                readError = undefined;
+              } catch (err) {
+                readError = err;
+              }
+            }
+            if (!after) {
+              queue.push({
+                type: 'model_switch',
+                status: 'unconfirmed',
+                next: pendingChoice,
+                message: errorMessage(readError),
+              });
+              queue.push({
+                type: 'ui_notice',
+                message: '模型设置已提交但未能确认，本轮先用会话当前设置执行；稍后重试。',
+                level: 'warning',
+              });
+            } else if (after.model !== pendingChoice.model || after.effort !== pendingChoice.effort) {
+              queue.push({
+                type: 'model_switch',
+                status: 'failed',
+                previous,
+                next: pendingChoice,
+                message: '模型设置已提交，但回读结果与选择不一致',
+              });
+              queue.push({
+                type: 'ui_notice',
+                message: '模型设置已提交，但回读结果与选择不一致，本轮将使用会话当前设置。',
+                level: 'warning',
+              });
+            } else {
+              const from = previous?.model ? await modelLabel(previous.model) : undefined;
+              const to = await modelLabel(pendingChoice.model);
+              queue.push({ type: 'model_switch', status: 'applied', previous, next: pendingChoice });
+              queue.push({
+                type: 'ui_notice',
+                message: from ? `模型已切换：${from} → ${to}` : `模型已切换：${to}`,
+              });
+            }
+          }
+        }
         const turn = await requestTurn<{ id?: string; turn?: { id?: string } }>('turn/start', {
           threadId,
           input: [{ type: 'text', text: opts.prompt, text_elements: [] }],
           ...(opts.clientUserMessageId ? { clientUserMessageId: opts.clientUserMessageId } : {}),
           ...(opts.cwd ? { cwd: opts.cwd } : {}),
-          ...(opts.sessionId && effectiveModel && !replacementStarted ? { model: effectiveModel } : {}),
           ...(opts.additionalContext ? { additionalContext: opts.additionalContext } : {}),
         });
         turnId = turn.turn?.id ?? turn.id;
       } catch (err) {
-        if (!stopped) queue.push({ type: 'error', message: err instanceof Error ? err.message : String(err) });
+        if (!stopped) {
+          queue.push({
+            type: 'error',
+            message: isActiveWriterError(err)
+              ? CODEX_ACTIVE_WRITER_MESSAGE
+              : err instanceof Error ? err.message : String(err),
+          });
+        }
         finish();
       }
     };
@@ -673,6 +1081,21 @@ export class CodexAdapter implements AgentAdapter {
   }
 }
 
+function readNonEmptyString(value: unknown): string | null {
+  return typeof value === 'string' && value.trim() ? value.trim() : null;
+}
+
+function readThreadModelSettings(thread: ThreadResponse): { model: string | null; effort: string | null } {
+  return {
+    model: readNonEmptyString(thread.model) ?? readNonEmptyString(thread.thread?.model),
+    effort: readNonEmptyString(thread.reasoningEffort) ?? readNonEmptyString(thread.thread?.reasoningEffort),
+  };
+}
+
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
 function isMissingRolloutError(err: unknown): boolean {
   const message = err instanceof Error ? err.message : String(err);
   return /no rollout found|rollout not found|rollout.*missing/i.test(message);
@@ -684,9 +1107,56 @@ function isAdditionalContextCompatibilityError(err: unknown): boolean {
     && /unknown|unexpected|unsupported|invalid params?/i.test(message);
 }
 
+function isActiveWriterError(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err);
+  return /already has an active writer/i.test(message);
+}
+
 function isThreadNotLoadedError(err: unknown): boolean {
   const message = err instanceof Error ? err.message : String(err);
   return /thread not loaded/i.test(message);
+}
+
+function isThreadNotFoundError(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err);
+  return /thread not found|thread .* not found|no rollout found|rollout not found/i.test(message);
+}
+
+function filterModels(models: ModelOption[], includeHidden = false): ModelOption[] {
+  return includeHidden ? [...models] : models.filter((model) => !model.hidden);
+}
+
+function mapModel(entry: Record<string, unknown>): ModelOption | undefined {
+  const rawModel = typeof entry.model === 'string' && entry.model.trim() ? entry.model.trim() : '';
+  const rawId = typeof entry.id === 'string' && entry.id.trim() ? entry.id.trim() : '';
+  if (!rawModel && !rawId) return undefined;
+  const model = rawModel || rawId;
+  const displayName = typeof entry.displayName === 'string' && entry.displayName.trim() ? entry.displayName.trim() : model;
+  const description = typeof entry.description === 'string' ? entry.description : '';
+  const supportedReasoningEfforts = Array.isArray(entry.supportedReasoningEfforts)
+    ? entry.supportedReasoningEfforts
+      .map((effort) => {
+        if (typeof effort === 'string') return effort;
+        if (effort && typeof effort === 'object' && typeof (effort as { reasoningEffort?: unknown }).reasoningEffort === 'string') {
+          return (effort as { reasoningEffort: string }).reasoningEffort;
+        }
+        return undefined;
+      })
+      .filter((effort): effort is string => Boolean(effort))
+    : [];
+  const defaultReasoningEffort = typeof entry.defaultReasoningEffort === 'string' && entry.defaultReasoningEffort.trim()
+    ? entry.defaultReasoningEffort.trim()
+    : null;
+  return {
+    model,
+    id: rawId || model,
+    displayName,
+    description,
+    isDefault: entry.isDefault === true,
+    hidden: entry.hidden === true,
+    supportedReasoningEfforts,
+    defaultReasoningEffort,
+  };
 }
 
 function isDesktopMetadataCompatibilityError(err: unknown): boolean {

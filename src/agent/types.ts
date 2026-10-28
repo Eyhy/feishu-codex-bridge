@@ -103,8 +103,81 @@ export type AgentEvent =
   | { type: 'ui_title'; title: string }
   | { type: 'ui_editor_text'; text: string }
   | { type: 'ui_open_url'; url: string; instructions?: string }
+  | {
+      type: 'model_switch';
+      status: 'applied' | 'failed' | 'active_writer' | 'validation_failed' | 'unconfirmed';
+      previous?: { model: string | null; effort: string | null };
+      next?: ModelChoice;
+      message?: string;
+    }
   | { type: 'done'; sessionId?: string }
   | { type: 'error'; message: string };
+
+/** A thread's persisted model settings, read without loading the thread. */
+export interface ThreadModelState {
+  model: string | null;
+  effort: string | null;
+  loaded: boolean;
+  canAcceptDirectInput: boolean | null;
+}
+
+/** A model advertised by the agent's model catalog. */
+export interface ModelOption {
+  model: string;
+  id: string;
+  displayName: string;
+  description: string;
+  isDefault: boolean;
+  hidden: boolean;
+  supportedReasoningEfforts: string[];
+  defaultReasoningEffort: string | null;
+}
+
+export interface ListModelsOptions {
+  includeHidden?: boolean;
+  forceRefresh?: boolean;
+}
+
+/** The model + reasoning effort pair a user picked for a thread. */
+export interface ModelChoice {
+  model: string;
+  effort: string;
+}
+
+/**
+ * Result of writing a thread's persisted settings. `applied` is only reported
+ * after a read-back confirms both values; `unconfirmed` means the write was
+ * accepted but the read-back failed.
+ */
+export interface ModelSwitchResult {
+  status: 'applied' | 'failed' | 'active_writer' | 'unconfirmed';
+  previous?: { model: string | null; effort: string | null };
+  next?: ModelChoice;
+  message?: string;
+}
+
+/**
+ * Result of copying a source thread's model settings onto an already forked
+ * thread. A fork itself does not inherit model or effort, so this is a
+ * separate, best-effort step that never deletes the fork when it fails.
+ */
+export type ModelCopyResult =
+  | { status: 'applied' | 'skipped' }
+  | { status: 'failed'; message: string };
+
+/** Fixed user-facing copy when a fork keeps existing but its model copy fails. */
+export const FORK_MODEL_COPY_FAILED_MESSAGE = '模型未继承，可在新话题用 /model 重选';
+
+/** Distinguishes an unreadable thread from one that no longer exists. */
+export class ThreadModelReadError extends Error {
+  readonly code: 'not_found' | 'read_failed';
+
+  constructor(code: 'not_found' | 'read_failed', message: string) {
+    super(message);
+    this.name = 'ThreadModelReadError';
+    this.code = code;
+  }
+}
 
 export interface AgentRunOptions {
   prompt: string;
@@ -115,6 +188,10 @@ export interface AgentRunOptions {
   cwd?: string;
   sessionId?: string;
   model?: string;
+  /** Model selected before this scope had a thread. Codex applies it to the
+   * thread it creates or resumes; OMP ignores it and uses `model` above. */
+  pendingModel?: string;
+  pendingEffort?: string;
   permissionMode?: 'default' | 'acceptEdits' | 'bypassPermissions' | 'plan';
   /** Local image paths to pass to agents that support native image flags. */
   imagePaths?: string[];
@@ -167,6 +244,14 @@ export interface AgentAdapter {
   listSessionPage?(cwd: string, cursor?: string, searchTerm?: string): Promise<import('../project/types').SessionPage>;
   listProjectRoots?(): Promise<string[]>;
   readSession?(threadId: string): Promise<import('../project/types').SessionDetail>;
+  /** Read a thread's persisted model settings without loading it. */
+  readThreadModel?(threadId: string): Promise<ThreadModelState>;
+  /** List the models this agent can use. */
+  listModels?(opts?: ListModelsOptions): Promise<ModelOption[]>;
+  /** Persist a thread's model + effort and confirm it with a read-back. */
+  switchThreadModel?(threadId: string, choice: ModelChoice): Promise<ModelSwitchResult>;
+  /** Copy a source thread's persisted model + effort onto an existing fork. */
+  copyThreadModel?(sourceThreadId: string, targetThreadId: string): Promise<ModelCopyResult>;
   createSession?(cwd: string): Promise<import('../project/types').SessionSummary>;
   renameSession?(threadId: string, title: string): Promise<void>;
   archiveSession?(threadId: string): Promise<void>;
@@ -174,6 +259,8 @@ export interface AgentAdapter {
   forkSession?(threadId: string, cwd?: string): Promise<import('../project/types').SessionSummary>;
   compactSession?(threadId: string): Promise<void>;
   reviewSession?(threadId: string): Promise<void>;
+  /** Release a thread writer after a short idle grace, if supported. */
+  releaseWriterIfIdle?(): Promise<void>;
   /** Close shared adapter resources such as a long-lived app-server child. */
   close?(): Promise<void>;
 }

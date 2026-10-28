@@ -3,6 +3,11 @@ import { paths } from '../config/paths';
 import { writeAtomicFile } from '../config/atomic-file';
 import { log } from '../core/logger';
 
+export interface PendingModel {
+  model: string;
+  effort: string;
+}
+
 export interface SessionEntry {
   /** May be absent if the entry was created by /timeout before any run
    * recorded a session id. Treat absence as "no resumable session". */
@@ -11,9 +16,15 @@ export interface SessionEntry {
   cwd?: string;
   updatedAt: number;
   /** Per-scope idle-timeout override (minutes). 0 = explicitly off for this
-   * scope, undefined = follow global default. /new clears the whole entry,
-   * so this resets to "follow global" when the user starts a new session. */
+   * scope, undefined = follow global default. /new clears the session binding
+   * (keeping a pending model), so this resets to "follow global" when the
+   * user starts a new session. */
   idleTimeoutMinutes?: number;
+  /** Model selected before this scope has a Codex thread. The pair is
+   * persisted together and survives /new so the next thread created in this
+   * topic starts with the user's choice. */
+  pendingModel?: string;
+  pendingEffort?: string;
 }
 
 type SessionMap = Record<string, SessionEntry>;
@@ -36,20 +47,26 @@ export class SessionStore {
         if (!entry || typeof entry.updatedAt !== 'number') continue;
         // Drop entries without a `cwd`/`sessionId` pair *unless* there's
         // some other persisted state worth keeping (e.g. an idle-timeout
-        // override). Resuming a session whose cwd we don't know about
-        // would make OMP resume fail, so resume keys still need
-        // the full pair; but a bare timeout override is fine on its own.
+        // override or a model selected before the first run). Resuming a
+        // session whose cwd we don't know about would make OMP resume fail,
+        // so resume keys still need the full pair; but a bare timeout
+        // override or pending model is fine on its own.
         const sessionId = typeof entry.sessionId === 'string' ? entry.sessionId : undefined;
         const cwd = typeof entry.cwd === 'string' ? entry.cwd : undefined;
         const idleTimeoutMinutes =
           typeof entry.idleTimeoutMinutes === 'number' ? entry.idleTimeoutMinutes : undefined;
+        const pendingModel = typeof entry.pendingModel === 'string' ? entry.pendingModel : undefined;
+        const pendingEffort =
+          typeof entry.pendingEffort === 'string' ? entry.pendingEffort : undefined;
+        const hasPending = pendingModel !== undefined && pendingEffort !== undefined;
         const hasSession = sessionId !== undefined && cwd !== undefined;
-        if (!hasSession && idleTimeoutMinutes === undefined) continue;
+        if (!hasSession && idleTimeoutMinutes === undefined && !hasPending) continue;
         this.data[chatId] = {
           ...(sessionId !== undefined ? { sessionId } : {}),
           ...(cwd !== undefined ? { cwd } : {}),
           updatedAt: entry.updatedAt,
           ...(idleTimeoutMinutes !== undefined ? { idleTimeoutMinutes } : {}),
+          ...(hasPending ? { pendingModel, pendingEffort } : {}),
         };
       }
     } catch (err) {
@@ -75,8 +92,9 @@ export class SessionStore {
   }
 
   set(chatId: string, sessionId: string, cwd: string): void {
-    // Preserve idleTimeoutMinutes across run starts — it's a per-scope
-    // preference, not per-run-instance state. /new (clear) wipes it.
+    // Preserve per-scope preferences across run starts: the idle-timeout
+    // override is not per-run state, and a pending model must survive the
+    // system event that binds the new thread to this scope.
     const prev = this.data[chatId];
     this.data[chatId] = {
       sessionId,
@@ -85,6 +103,9 @@ export class SessionStore {
       ...(prev?.idleTimeoutMinutes !== undefined
         ? { idleTimeoutMinutes: prev.idleTimeoutMinutes }
         : {}),
+      ...(prev?.pendingModel !== undefined && prev.pendingEffort !== undefined
+        ? { pendingModel: prev.pendingModel, pendingEffort: prev.pendingEffort }
+        : {}),
     };
     this.schedulePersist();
   }
@@ -92,6 +113,55 @@ export class SessionStore {
   clear(chatId: string): void {
     if (!(chatId in this.data)) return;
     delete this.data[chatId];
+    this.schedulePersist();
+  }
+
+  /** Start a new session in this scope but keep the model selected before
+   * the previous session existed. /new uses this; clear() still removes the
+   * whole entry. */
+  clearSession(chatId: string): void {
+    const prev = this.data[chatId];
+    if (!prev) return;
+    if (prev.pendingModel !== undefined && prev.pendingEffort !== undefined) {
+      this.data[chatId] = {
+        updatedAt: Date.now(),
+        pendingModel: prev.pendingModel,
+        pendingEffort: prev.pendingEffort,
+      };
+      this.schedulePersist();
+      return;
+    }
+    this.clear(chatId);
+  }
+
+  /** Pending model selection for this scope. Undefined unless both fields
+   * were persisted together. */
+  getPending(chatId: string): PendingModel | undefined {
+    const entry = this.data[chatId];
+    if (!entry || entry.pendingModel === undefined || entry.pendingEffort === undefined) {
+      return undefined;
+    }
+    return { model: entry.pendingModel, effort: entry.pendingEffort };
+  }
+
+  setPending(chatId: string, pending: PendingModel): void {
+    const prev = this.data[chatId];
+    this.data[chatId] = {
+      ...(prev ?? { updatedAt: Date.now() }),
+      pendingModel: pending.model,
+      pendingEffort: pending.effort,
+      updatedAt: Date.now(),
+    };
+    this.schedulePersist();
+  }
+
+  /** Remove the pending selection, keeping the session binding and timeout. */
+  clearPending(chatId: string): void {
+    const prev = this.data[chatId];
+    if (!prev) return;
+    if (prev.pendingModel === undefined && prev.pendingEffort === undefined) return;
+    const { pendingModel: _model, pendingEffort: _effort, ...rest } = prev;
+    this.data[chatId] = { ...rest, updatedAt: Date.now() };
     this.schedulePersist();
   }
 

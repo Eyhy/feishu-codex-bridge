@@ -17,7 +17,7 @@
 
 | 能力 | 带来的体验 |
 | --- | --- |
-| 飞书原生话题映射 Codex Session | 多个项目和任务互不串线，历史会话可以继续 |
+| 飞书原生话题映射 Codex 会话 | 多个项目和任务互不串线，历史会话可以继续 |
 | 实时状态卡与自动同步 | 离开电脑也能看到工具进度和最终结果 |
 | 审批与用户输入卡片 | Codex 需要确认时，直接在飞书处理 |
 | 本地主动长连接 | 不搭公网服务器、不配置 Webhook、不开放入站端口 |
@@ -32,11 +32,11 @@ sequenceDiagram
     participant B as Feishu Codex Bridge
     participant C as 本机 Codex
     U->>B: 在项目群中新建话题并发送需求
-    B->>C: 创建或恢复 Codex Session
+    B->>C: 创建或恢复 Codex 会话
     C-->>B: 流式回复、工具进度、审批请求
     B-->>U: 更新同一张飞书状态卡
     U->>B: 批准、补充输入或停止
-    B->>C: 继续原 Session
+    B->>C: 继续原会话
 ```
 
 适合这些场景：
@@ -99,7 +99,7 @@ node bin/feishu-omp-bridge.mjs start
 - 中文欢迎卡、项目卡、会话卡和状态卡
 - 从 Codex 历史会话发现本地项目
 - 搜索、恢复、新建、分支、归档和撤销归档 Codex 会话
-- 话题与 Codex Session 的持久化映射
+- 话题与 Codex 会话的持久化映射
 - 可持续更新的进度卡、故障后普通消息降级、停止任务和继续追问
 - 长任务每 8 分钟自动换卡，卡片更新失败时自动降级为普通消息
 - 多问题用户输入卡片，以及本次允许、本会话允许、拒绝和取消审批
@@ -130,7 +130,7 @@ Codex 模式的映射关系：
 project_key                  → chat_id
 chat_id + topic_id           → codex_thread_id
 本地项目目录                  → 飞书项目群
-Codex Session                → 飞书话题
+Codex 会话                   → 飞书话题
 ```
 
 映射只保存在本机，不会展示给普通用户。
@@ -179,7 +179,9 @@ Bridge 默认不会把 `chat_id`、`sender_id`、`thread_id` 拼进可见 prompt
 
 ### 使用设备上的 Codex 配置
 
-Bridge 默认不会设置模型、代理、provider 或 service tier，而是让 Codex app-server 使用本机登录状态和配置。
+Bridge 默认不设置模型、代理、provider 或 service tier，而是让 Codex app-server 使用本机登录状态和配置，只有 `/model` 显式选择后才写当前会话。
+Codex 话题默认沿用该 Codex 会话自己的模型与推理强度；配置里的 `preferences.ompModel` / `codexModel` 只用于 OMP 后端，不会覆盖 Codex 会话。
+在飞书里发送 `/model` 可以切换当前话题的模型与推理强度；选择会写入当前 Codex 会话，桌面端下一轮沿用。发送 `/model default` 清除飞书侧的选择，当前会话保留它自己的设置。
 
 macOS 上，未显式配置二进制时会优先使用 ChatGPT 桌面应用自带的 Codex runtime，避免系统 PATH 中的旧 CLI 无法解析桌面端模型缓存：
 
@@ -224,7 +226,7 @@ codexAppServerBinary
 
 进入项目群，直接点击飞书原生的“新建话题”，发送第一条需求。
 
-Bridge 会自动创建一个 Codex Session，把首条话题内容作为第一条需求，并保存话题与 Session 的绑定。无需关键词，也不需要先点击机器人卡片。
+Bridge 会自动创建一个 Codex 会话，把首条话题内容作为第一条需求，并保存话题与会话的绑定。无需关键词，也不需要先点击机器人卡片。
 
 需要恢复历史对话时，点击“查看会话”，选择原会话后，Bridge 会为它创建对应话题。
 
@@ -295,8 +297,8 @@ Bridge 的运行数据默认位于 `~/.feishu-omp-bridge/`：
 | --- | --- |
 | `config.json` | 应用配置和 SecretRef |
 | `secrets.enc` | 加密后的 App Secret |
-| `sessions.json` | 飞书范围到 Agent Session 的映射 |
-| `project-bindings.json` | 项目群、话题和 Codex Session 的映射 |
+| `sessions.json` | 飞书作用域到 Agent 会话的映射 |
+| `project-bindings.json` | 项目群、话题和 Codex 会话的映射 |
 | `tasks.json` | 最近任务的本地状态、阶段和验收摘要；不保存完整用户 prompt |
 | `projects/feishu-assistant/` | Feishu Assistant 专用 Codex Project 与项目级说明 |
 | `logs/` | 结构化运行日志 |
@@ -304,7 +306,7 @@ Bridge 的运行数据默认位于 `~/.feishu-omp-bridge/`：
 
 Codex 原始会话仍由 Codex 管理，通常位于 `~/.codex/sessions/`。
 
-飞书消息通过 app-server 写入 Codex Session 后可以继续执行，但已经打开的 Codex 桌面窗口不一定实时刷新外部写入的轮次；重新打开对应任务即可查看。
+飞书消息通过 app-server 写入 Codex 会话后可以继续执行，但已经打开的 Codex 桌面窗口不一定实时刷新外部写入的轮次；重新打开对应任务即可查看。
 
 Bridge 创建新会话时会写入桌面兼容的 thread 来源、稳定的飞书消息 ID 和干净的用户可见标题。若桌面端侧栏仍未显示，请在 Chats 过滤器中选择按时间排序，或重启桌面端。Bridge 不会直接修改 Codex 的 SQLite 数据库或桌面端私有缓存。
 
@@ -381,9 +383,12 @@ codex --version
 
 macOS 如果同时安装了旧 Homebrew CLI 和新版 ChatGPT 桌面端，优先使用桌面端 runtime。
 
+如果当前会话的模型或推理强度在这台设备上不可用，Bridge 会明确提示本轮失败：用 `/model` 重新选择，或用 `/new` 新建会话。
+
 ### 原会话无法恢复
 
-没有 rollout 或使用不兼容旧配置的历史会话会自动新建 Session 并重试。新 Session 继续使用相同项目目录。
+没有 rollout 或使用不兼容旧配置的历史会话会自动新建会话并重试。新会话继续使用相同项目目录。
+模型或推理强度不可用不会触发自动新建；Bridge 只提示并保留原来的会话绑定。
 
 ### 自动同步会不会刷屏
 

@@ -50,7 +50,7 @@ import type { TaskRecord, TaskStatus } from '../task/types';
 import type { WorkspaceStore } from '../workspace/store';
 import type { ProjectCatalog } from '../project/catalog';
 import type { Project, ProjectBindingStore } from '../project/types';
-import { ActiveRuns, type RunHandle } from './active-runs';
+import { ActiveRuns, releaseWriterIfAllIdle, type RunHandle } from './active-runs';
 import { ChatModeCache, type ChatMode } from './chat-mode-cache';
 import { handleCommentMention } from './comments';
 import { createFeishuHostIntegration } from './feishu-host';
@@ -69,6 +69,31 @@ import { bindNativeTopicSession } from '../project/topic-session';
 import { fetchFeishuTopicTitle, syncBoundTopicTitles } from '../project/topic-title-sync';
 import { FEISHU_ASSISTANT_PROJECT_KEY } from '../project/assistant';
 import { threadTitleFromText } from './thread-title';
+
+/** OMP keeps its configured model; Codex always follows the thread's own setting. */
+export function modelOverrideForBackend(cfg: AppConfig, backend: 'omp' | 'codex'): { model?: string } {
+  return backend === 'omp' ? { model: getOmpModel(cfg) } : {};
+}
+
+/** Codex applies a pending model choice on the next run; OMP never reads it. */
+export function pendingOptionsForBackend(
+  sessions: Pick<SessionStore, 'getPending'>,
+  scope: string,
+  backend: 'omp' | 'codex',
+): { pendingModel?: string; pendingEffort?: string } {
+  if (backend !== 'codex') return {};
+  const pending = sessions.getPending(scope);
+  return pending ? { pendingModel: pending.model, pendingEffort: pending.effort } : {};
+}
+
+/** A pending choice survives failures that leave the thread untouched. */
+export function settlePendingForModelSwitch(
+  sessions: Pick<SessionStore, 'clearPending'>,
+  scope: string,
+  status: 'applied' | 'failed' | 'active_writer' | 'validation_failed' | 'unconfirmed',
+): void {
+  if (status === 'applied' || status === 'failed') sessions.clearPending(scope);
+}
 
 const DEBOUNCE_MS = 600;
 
@@ -754,6 +779,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
   });
 
   let run: ReturnType<AgentAdapter['run']>;
+  const backend = getAgentBackend(controls.cfg);
   try {
     run = agent.run({
       prompt,
@@ -761,12 +787,13 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
       title,
       sessionId: resumeFrom,
       cwd,
-      model: getOmpModel(controls.cfg),
+      ...modelOverrideForBackend(controls.cfg, backend),
+      ...pendingOptionsForBackend(sessions, scope, backend),
       imagePaths,
       stopGraceMs: getAgentStopGraceMs(controls.cfg),
       hostTools: feishuHost.tools,
       hostUriSchemes: feishuHost.uriSchemes,
-      ...(getAgentBackend(controls.cfg) === 'codex'
+      ...(backend === 'codex'
         ? { additionalContext: buildFeishuTurnContext(batch, project) }
         : {}),
     });
@@ -981,6 +1008,9 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     if (reactionId) {
       await removeReaction(channel, lastMsg.messageId, reactionId);
     }
+    // Releasing here keeps a successful turn successful even if the writer
+    // release fails; the helper logs and swallows that failure.
+    await releaseWriterIfAllIdle(activeRuns, agent);
   }
 }
 
@@ -1133,6 +1163,10 @@ async function processAgentStream(
           log.info('session', 'set', { sessionId: evt.sessionId });
         }
         state = reduce(state, evt);
+        continue;
+      }
+      if (evt.type === 'model_switch') {
+        settlePendingForModelSwitch(sessions, scope, evt.status);
         continue;
       }
       if (evt.type === 'usage') {

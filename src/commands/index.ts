@@ -1,7 +1,9 @@
 import { stat } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import type { LarkChannel, NormalizedMessage } from '@larksuiteoapi/node-sdk';
-import type { AgentAdapter } from '../agent/types';
+import type { AgentAdapter, ModelOption, ModelSwitchResult, ThreadModelState } from '../agent/types';
+import { FORK_MODEL_COPY_FAILED_MESSAGE } from '../agent/types';
+import { releaseWriterIfAllIdle } from '../bot/active-runs';
 import type { ActiveRuns } from '../bot/active-runs';
 import {
   accountCurrentCard,
@@ -10,8 +12,17 @@ import {
   accountSuccessCard,
 } from '../card/account-cards';
 import { configCancelledCard, configFormCard, configSavedCard } from '../card/config-card';
+import {
+  MODEL_DEFAULT_EFFORT,
+  effortSelectCard,
+  modelErrorCard,
+  modelPendingCard,
+  modelSelectCard,
+  modelSwitchSuccessCard,
+} from '../card/model-cards';
 import { forgetManagedCard, sendManagedCard, updateManagedCard } from '../card/managed';
 import {
+  effortLabel,
   helpCard,
   projectFeedbackCard,
   projectWelcomeCard,
@@ -28,8 +39,10 @@ import {
   welcomeCard,
   workspacesCard,
 } from '../card/templates';
+import type { StatusModelInfo } from '../card/templates';
 import type { AppConfig, MessageReplyMode, TenantBrand } from '../config/schema';
 import {
+  getAgentBackend,
   getAgentStopGraceMs,
   getEnforceProjectRootSandbox,
   getMaxConcurrentRuns,
@@ -95,7 +108,7 @@ export interface CommandContext {
    */
   scope: string;
   /** Resolved chat mode for `msg.chatId`. Used by /status to surface the
-   * scope semantic to the user (`topic` shows "话题独立 session"). */
+   * scope semantic to the user (`topic` shows "本话题：独立会话"). */
   chatMode: 'p2p' | 'group' | 'topic';
   sessions: SessionStore;
   workspaces: WorkspaceStore;
@@ -104,6 +117,8 @@ export interface CommandContext {
   controls: Controls;
   /** Set when invoked from a CardKit 2.0 form submit. Keys are input `name`s. */
   formValue?: Record<string, unknown>;
+  /** Raw callback value of the clicked card action. */
+  cardPayload?: Record<string, unknown>;
   /** True when this invocation came from a card button click rather than a
    * text command. Determines whether to update the existing card vs send a
    * new one. */
@@ -131,6 +146,7 @@ const handlers: Record<string, Handler> = {
   '/cd': handleCd,
   '/ws': handleWs,
   '/status': handleStatus,
+  '/model': handleModel,
   '/sync': handleSync,
   '/help': handleHelp,
   '/account': handleAccount,
@@ -157,6 +173,7 @@ const ADMIN_COMMANDS = new Set([
   '/doctor',
   '/cd',
   '/ws',
+  '/model',
 ]);
 
 function isAdminCommand(cmd: string): boolean {
@@ -216,9 +233,11 @@ export async function runCommandHandler(
       sender: ctx.msg.senderId.slice(-6),
       via: 'card',
     });
-    // Card actions can't reply naturally (the `msg` is synthesized); the
-    // click is silently denied. The button only renders for users who got
-    // the original admin card in the first place, so this is an edge case.
+    // Model switching has a dedicated user-facing denial: the status card
+    // button is visible to everyone, so silence here would look broken.
+    if (name === 'model') {
+      await reply(ctx, '仅管理员可切换模型');
+    }
     return true;
   }
   try {
@@ -294,8 +313,22 @@ async function handleNew(args: string, ctx: CommandContext): Promise<void> {
   }
 
   const wasRunning = ctx.activeRuns.interrupt(ctx.scope);
-  ctx.sessions.clear(ctx.scope);
-  await reply(ctx, wasRunning ? '已中断当前任务并开始新会话。' : '已开始新会话。');
+  const pending = ctx.sessions.getPending(ctx.scope);
+  ctx.sessions.clearSession(ctx.scope);
+  if (!pending) {
+    await reply(ctx, wasRunning ? '已中断当前任务并开始新会话。' : '已开始新会话。');
+    return;
+  }
+  try {
+    const models = await listModelOptions(ctx, true);
+    const name = modelDisplayName(models, pending.model);
+    await reply(
+      ctx,
+      `${wasRunning ? '已中断当前任务并开始新会话' : '已开始新会话'}；模型选择保留：${name}（待生效）。`,
+    );
+  } finally {
+    await releaseWriterIfAllIdle(ctx.activeRuns, ctx.agent);
+  }
 }
 
 async function handleWelcome(_args: string, ctx: CommandContext): Promise<void> {
@@ -660,20 +693,35 @@ async function handleSession(args: string, ctx: CommandContext): Promise<void> {
     ]);
     return;
   } else if (action === 'fork' || action.startsWith('fork ')) {
-    const sourceThreadId = action.slice(4).trim() || currentTopicThreadId(ctx);
-    if (!sourceThreadId) return reply(ctx, '请在已连接的 Codex 话题中创建分支会话。');
-    if (!ctx.agent.forkSession) return reply(ctx, '当前 Codex 版本不支持分支会话。');
-    let forked: import('../project/types').SessionSummary;
     try {
-      forked = await ctx.agent.forkSession(sourceThreadId, project.cwd);
-    } catch (err) {
-      await commandFeedback(ctx, '分支会话创建失败', operationError(err), []);
+      const sourceThreadId = action.slice(4).trim() || currentTopicThreadId(ctx);
+      if (!sourceThreadId) return reply(ctx, '请在已连接的 Codex 话题中创建分支会话。');
+      if (!ctx.agent.forkSession) return reply(ctx, '当前 Codex 版本不支持分支会话。');
+      let forked: import('../project/types').SessionSummary;
+      try {
+        forked = await ctx.agent.forkSession(sourceThreadId, project.cwd);
+      } catch (err) {
+        await commandFeedback(ctx, '分支会话创建失败', operationError(err), []);
+        return;
+      }
+      let copyMessage: string | undefined;
+      if (ctx.agent.copyThreadModel) {
+        try {
+          const copied = await ctx.agent.copyThreadModel(sourceThreadId, forked.threadId);
+          if (copied.status === 'failed') copyMessage = FORK_MODEL_COPY_FAILED_MESSAGE;
+        } catch (err) {
+          log.warn('command', 'fork-model-copy-failed', { error: operationError(err) });
+          copyMessage = FORK_MODEL_COPY_FAILED_MESSAGE;
+        }
+      }
+      const source = (await ctx.agent.listSessions(project.cwd)).find((session) => session.threadId === sourceThreadId);
+      const forkTitle = forked.name?.trim() || `${source?.name?.trim() || '当前会话'} · 分支`;
+      await createSessionTopic(ctx, project, forked.threadId, forkTitle);
+      if (copyMessage) await reply(ctx, copyMessage);
       return;
+    } finally {
+      await releaseWriterIfAllIdle(ctx.activeRuns, ctx.agent);
     }
-    const source = (await ctx.agent.listSessions(project.cwd)).find((session) => session.threadId === sourceThreadId);
-    const forkTitle = forked.name?.trim() || `${source?.name?.trim() || '当前会话'} · 分支`;
-    await createSessionTopic(ctx, project, forked.threadId, forkTitle);
-    return;
   } else {
     return handleSessions('', ctx);
   }
@@ -812,7 +860,7 @@ async function handleCd(args: string, ctx: CommandContext): Promise<void> {
   ctx.activeRuns.interrupt(ctx.scope);
   ctx.workspaces.setCwd(ctx.scope, absolute);
   ctx.sessions.clear(ctx.scope);
-  await reply(ctx, `✓ 已切换 cwd 到 \`${absolute}\`\n（session 已重置）`);
+  await reply(ctx, `✓ 已切换 cwd 到 \`${absolute}\`\n（会话已重置）`);
 }
 
 async function handleWs(args: string, ctx: CommandContext): Promise<void> {
@@ -869,7 +917,7 @@ async function handleWsUse(name: string, ctx: CommandContext): Promise<void> {
   ctx.activeRuns.interrupt(ctx.scope);
   ctx.workspaces.setCwd(ctx.scope, cwd);
   ctx.sessions.clear(ctx.scope);
-  await reply(ctx, `✓ 已切换到 \`${name}\` (${cwd})\n（session 已重置）`);
+  await reply(ctx, `✓ 已切换到 \`${name}\` (${cwd})\n（会话已重置）`);
 }
 
 async function handleWsRemove(name: string, ctx: CommandContext): Promise<void> {
@@ -884,10 +932,50 @@ async function handleWsRemove(name: string, ctx: CommandContext): Promise<void> 
   await reply(ctx, `✓ 已删除工作空间：\`${name}\``);
 }
 
+async function pendingModelName(ctx: CommandContext, modelId: string): Promise<string> {
+  const models = await listModelOptions(ctx, true);
+  return modelDisplayName(models, modelId);
+}
+
+async function readStatusModel(ctx: CommandContext, threadId?: string): Promise<StatusModelInfo | undefined> {
+  if (ctx.agent.id !== 'codex') return undefined;
+  const pending = ctx.sessions.getPending(ctx.scope);
+  const pendingDisplayName = pending ? await pendingModelName(ctx, pending.model) : undefined;
+  const pendingInfo: StatusModelInfo = pendingDisplayName ? { pendingDisplayName } : {};
+  if (!threadId) return pendingDisplayName ? pendingInfo : {};
+  if (!ctx.agent.readThreadModel) return pendingDisplayName ? pendingInfo : {};
+  try {
+    const state = await ctx.agent.readThreadModel(threadId);
+    if (!state.model) return { readFailed: true, ...pendingInfo };
+    const modelId = state.model;
+    let displayName = modelId;
+    if (ctx.agent.listModels) {
+      try {
+        const models = await ctx.agent.listModels({ includeHidden: true });
+        const match = models.find((model) => model.model === modelId || model.id === modelId);
+        if (match?.displayName) displayName = match.displayName;
+      } catch (err) {
+        log.warn('commands', 'status-model-list-failed', {
+          threadId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+    return { displayName, effort: state.effort ?? undefined, ...pendingInfo };
+  } catch (err) {
+    log.warn('commands', 'status-model-read-failed', {
+      threadId,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return { readFailed: true, ...pendingInfo };
+  }
+}
+
 async function handleStatus(_args: string, ctx: CommandContext): Promise<void> {
   const project = ctx.projectBindings?.findProjectByChat(ctx.msg.chatId);
   if (project) {
     const topic = ctx.msg.threadId ? ctx.projectBindings?.findTopic(ctx.msg.chatId, ctx.msg.threadId) : undefined;
+    const model = await readStatusModel(ctx, topic?.codexThreadId);
     await sendCommandCard(ctx, statusCard({
         cwd: project.cwd,
         sessionId: topic?.codexThreadId,
@@ -898,11 +986,13 @@ async function handleStatus(_args: string, ctx: CommandContext): Promise<void> {
         projectName: project.name,
         sessionTitle: topic ? '已绑定会话' : undefined,
         hideInternalIds: true,
+        model,
       }));
     return;
   }
   const cwd = ctx.workspaces.cwdFor(ctx.scope) ?? homedir();
   const sess = ctx.sessions.getRaw(ctx.scope);
+  const model = await readStatusModel(ctx, sess?.sessionId);
   const card = statusCard({
     cwd,
     sessionId: sess?.sessionId,
@@ -910,8 +1000,288 @@ async function handleStatus(_args: string, ctx: CommandContext): Promise<void> {
     agentName: ctx.agent.displayName,
     scope: ctx.scope,
     chatMode: ctx.chatMode,
+    model,
   });
   await sendCommandCard(ctx, card);
+}
+
+async function modelThreadId(ctx: CommandContext): Promise<string | undefined> {
+  const project = ctx.projectBindings?.findProjectByChat(ctx.msg.chatId);
+  if (project) {
+    return ctx.msg.threadId
+      ? ctx.projectBindings?.findTopic(ctx.msg.chatId, ctx.msg.threadId)?.codexThreadId
+      : undefined;
+  }
+  return ctx.sessions.getRaw(ctx.scope)?.sessionId;
+}
+
+async function readModelState(ctx: CommandContext, threadId: string): Promise<ThreadModelState | undefined> {
+  try {
+    return await ctx.agent.readThreadModel?.(threadId);
+  } catch (err) {
+    log.warn('commands', 'model-state-read-failed', {
+      threadId,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return undefined;
+  }
+}
+
+async function listModelOptions(
+  ctx: CommandContext,
+  includeHidden: boolean,
+  forceRefresh = false,
+): Promise<ModelOption[] | undefined> {
+  if (!ctx.agent.listModels) return undefined;
+  try {
+    return await ctx.agent.listModels({ includeHidden, forceRefresh });
+  } catch (err) {
+    log.warn('commands', 'model-list-failed', {
+      includeHidden,
+      forceRefresh,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return undefined;
+  }
+}
+
+function modelDisplayName(models: ModelOption[] | undefined, modelId?: string | null): string {
+  if (!modelId) return '未知';
+  return models?.find((model) => model.model === modelId || model.id === modelId)?.displayName ?? modelId;
+}
+
+function modelIdFromForm(ctx: CommandContext): string | undefined {
+  const raw = ctx.formValue?.model_id ?? ctx.cardPayload?.model_id;
+  return typeof raw === 'string' && raw.trim() ? raw : undefined;
+}
+
+function effortFromForm(ctx: CommandContext): string | undefined {
+  const raw = ctx.formValue?.effort;
+  const value = Array.isArray(raw) ? raw[0] : raw;
+  return typeof value === 'string' && value.trim() ? value : undefined;
+}
+
+async function addCurrentModel(
+  ctx: CommandContext,
+  models: ModelOption[],
+  currentModel: string | null | undefined,
+): Promise<ModelOption[]> {
+  if (!currentModel || models.some((model) => model.model === currentModel)) return models;
+  const all = await listModelOptions(ctx, true);
+  const current = all?.find((model) => model.model === currentModel);
+  return current ? [current, ...models] : models;
+}
+
+async function openModelStep1(
+  ctx: CommandContext,
+  threadId: string | undefined,
+  notice?: string,
+): Promise<void> {
+  const state = threadId ? await readModelState(ctx, threadId) : undefined;
+  const pending = threadId ? undefined : ctx.sessions.getPending(ctx.scope);
+  const currentModel = state?.model ?? pending?.model ?? null;
+  const models = await listModelOptions(ctx, false);
+  if (!models) {
+    const current = currentModel ? `当前模型：${modelDisplayName(undefined, currentModel)}。` : '';
+    await sendCommandCard(ctx, modelErrorCard(
+      '无法读取模型列表',
+      [current, '读取模型列表失败，请稍后重试。'].filter(Boolean).join('\n'),
+    ));
+    return;
+  }
+  if (models.length === 0) {
+    const current = currentModel ? `当前模型：${modelDisplayName(undefined, currentModel)}。` : '';
+    await sendCommandCard(ctx, modelErrorCard(
+      '没有可用模型',
+      [current, '模型列表为空，请稍后重试。'].filter(Boolean).join('\n'),
+    ));
+    return;
+  }
+  await sendCommandCard(ctx, modelSelectCard(
+    await addCurrentModel(ctx, models, currentModel),
+    currentModel,
+    notice,
+  ));
+}
+
+async function openModelStep2(ctx: CommandContext, threadId: string | undefined): Promise<void> {
+  const modelId = modelIdFromForm(ctx);
+  if (!modelId) {
+    await openModelStep1(ctx, threadId);
+    return;
+  }
+  const state = threadId ? await readModelState(ctx, threadId) : undefined;
+  const pending = threadId ? undefined : ctx.sessions.getPending(ctx.scope);
+  const models = await listModelOptions(ctx, true);
+  if (!models) {
+    await sendCommandCard(ctx, modelErrorCard('无法读取模型列表', '读取模型列表失败，请稍后重试。'));
+    return;
+  }
+  const model = models.find((item) => item.model === modelId || item.id === modelId);
+  if (!model) {
+    await openModelStep1(ctx, threadId, '模型列表已更新，请重新选择');
+    return;
+  }
+  if (model.supportedReasoningEfforts.length === 0 && !model.defaultReasoningEffort) {
+    await openModelStep1(ctx, threadId, '该模型没有可用的推理强度，请换一个模型。');
+    return;
+  }
+  await sendCommandCard(ctx, effortSelectCard(model, state?.effort ?? pending?.effort));
+}
+
+async function applyModelChoice(ctx: CommandContext, threadId: string | undefined): Promise<void> {
+  const modelId = modelIdFromForm(ctx);
+  const requestedEffort = effortFromForm(ctx);
+  if (!modelId || !requestedEffort) {
+    await openModelStep1(ctx, threadId, '选择已失效，请重新选择模型与强度。');
+    return;
+  }
+  const models = await listModelOptions(ctx, true, true);
+  if (!models) {
+    await sendCommandCard(ctx, modelErrorCard('无法读取模型列表', '读取模型列表失败，请稍后重试。'));
+    return;
+  }
+  if (models.length === 0) {
+    await sendCommandCard(ctx, modelErrorCard('没有可用模型', '模型列表为空，请稍后重试。'));
+    return;
+  }
+  const model = models.find((item) => item.model === modelId || item.id === modelId);
+  if (!model) {
+    await openModelStep1(ctx, threadId, '模型列表已更新，请重新选择');
+    return;
+  }
+  const effort = requestedEffort === MODEL_DEFAULT_EFFORT
+    ? model.defaultReasoningEffort ?? model.supportedReasoningEfforts[0]
+    : requestedEffort;
+  if (!effort || !model.supportedReasoningEfforts.includes(effort)) {
+    await openModelStep1(ctx, threadId, '模型列表已更新，请重新选择');
+    return;
+  }
+  if (!threadId) {
+    ctx.sessions.setPending(ctx.scope, { model: model.model, effort });
+    log.info('command', 'model-select-pending', {
+      scope: ctx.scope,
+      operatorId: ctx.msg.senderId.slice(-6),
+      operatorName: ctx.msg.senderName,
+      nextModel: model.model,
+      nextEffort: effort,
+    });
+    await sendCommandCard(ctx, modelPendingCard(model.displayName, effort));
+    return;
+  }
+  if (!ctx.agent.switchThreadModel) {
+    await sendCommandCard(ctx, modelErrorCard('无法切换模型', '当前后端不支持切换模型。'));
+    return;
+  }
+  const before = await readModelState(ctx, threadId);
+  const result: ModelSwitchResult = await ctx.agent.switchThreadModel(threadId, { model: model.model, effort });
+  if (result.status === 'applied' || result.status === 'failed') {
+    ctx.sessions.clearPending(ctx.scope);
+  }
+  const previousModelId = result.previous?.model ?? before?.model ?? null;
+  const previousEffort = result.previous?.effort ?? before?.effort ?? null;
+  log.info('command', 'model-switch', {
+    scope: ctx.scope,
+    threadId,
+    operatorId: ctx.msg.senderId.slice(-6),
+    operatorName: ctx.msg.senderName,
+    previousModel: previousModelId,
+    previousEffort,
+    nextModel: model.model,
+    nextEffort: effort,
+    result: result.status,
+  });
+  if (result.status === 'applied') {
+    await sendCommandCard(ctx, modelSwitchSuccessCard({
+      previousModel: modelDisplayName(models, previousModelId),
+      previousEffort,
+      nextModel: model.displayName,
+      nextEffort: effort,
+      operatorName: ctx.msg.senderName ?? ctx.msg.senderId,
+      at: new Date(),
+      fallbackFrom: previousEffort
+        && previousEffort !== effort
+        && !model.supportedReasoningEfforts.includes(previousEffort)
+        && (requestedEffort === MODEL_DEFAULT_EFFORT || requestedEffort === model.defaultReasoningEffort)
+        ? previousEffort
+        : undefined,
+    }));
+    return;
+  }
+  if (result.status === 'active_writer') {
+    await sendCommandCard(ctx, modelErrorCard(
+      '会话被桌面端占用',
+      result.message ?? '桌面端正在使用这个会话，请在桌面端关闭该会话后重试',
+    ));
+    return;
+  }
+  if (result.status === 'unconfirmed') {
+    await sendCommandCard(ctx, modelErrorCard(
+      '模型设置未确认',
+      '模型设置已提交，但回读未确认。请稍后用 /status 查看当前模型。',
+    ));
+    return;
+  }
+  await sendCommandCard(ctx, modelErrorCard(
+    '模型切换失败',
+    result.message ?? '切换模型失败，请稍后重试。',
+  ));
+}
+
+async function clearModelSelection(ctx: CommandContext, threadId: string | undefined): Promise<void> {
+  ctx.sessions.clearPending(ctx.scope);
+  if (!threadId) {
+    await reply(ctx, '已清除待生效选择，新会话跟随设备默认');
+    return;
+  }
+  const state = await readModelState(ctx, threadId);
+  if (!state?.model) {
+    await reply(ctx, '飞书不再设置模型，当前会话保留自己的模型（要换请重新选择）');
+    return;
+  }
+  await reply(ctx, `飞书不再设置模型，当前会话保留 ${state.model}（要换请重新选择）`);
+}
+
+async function handleModel(args: string, ctx: CommandContext): Promise<void> {
+  try {
+    await handleModelInner(args, ctx);
+  } finally {
+    await releaseWriterIfAllIdle(ctx.activeRuns, ctx.agent);
+  }
+}
+
+async function handleModelInner(args: string, ctx: CommandContext): Promise<void> {
+  if (!isAdmin(ctx.controls.cfg, ctx.msg.senderId)) {
+    await reply(ctx, '仅管理员可切换模型');
+    return;
+  }
+  if (getAgentBackend(ctx.controls.cfg) !== 'codex') {
+    await reply(ctx, '当前是 OMP 会话，模型切换仅支持 Codex');
+    return;
+  }
+  if (ctx.activeRuns.has(ctx.scope)) {
+    await reply(ctx, '任务执行中，结束后再切换');
+    return;
+  }
+  const threadId = await modelThreadId(ctx);
+  const command = args.trim();
+  if (command === 'default') {
+    await clearModelSelection(ctx, threadId);
+    return;
+  }
+  if (!command || command === 'reload' || command === 'back') {
+    await openModelStep1(ctx, threadId);
+    return;
+  }
+  if (command === 'choose-model') {
+    await openModelStep2(ctx, threadId);
+    return;
+  }
+  if (command === 'apply') {
+    await applyModelChoice(ctx, threadId);
+    return;
+  }
+  await reply(ctx, '用法：发送 /model 打开模型选择卡；发送 /model default 清除本话题的选择。');
 }
 
 async function handleSync(args: string, ctx: CommandContext): Promise<void> {
@@ -1006,14 +1376,14 @@ async function handleTimeout(args: string, ctx: CommandContext): Promise<void> {
   if (!trimmed) {
     const scopeMinutes = ctx.sessions.getIdleTimeoutMinutes(ctx.scope);
     const usage =
-      '\n\n用法:\n- `/timeout 15` 当前 session 设 15 分钟\n- `/timeout off` 当前 session 关闭探活\n- `/timeout default` 清除 session 覆盖,回退全局\n\n_注:`/new` 会清掉当前 session 的覆盖,回到全局_';
+      '\n\n用法:\n- `/timeout 15` 把本话题超时设为 15 分钟\n- `/timeout off` 关闭本话题探活\n- `/timeout default` 清除本话题的超时设置，回退全局\n\n_注：`/new` 会清掉本话题的超时设置，回到全局_';
     if (scopeMinutes !== undefined) {
       const effective =
-        scopeMinutes > 0 ? `${scopeMinutes} 分钟` : '已关闭（当前 session）';
-      await reply(ctx, `⏱ 当前 session 探活:${effective}\n全局默认:${formatGlobal()}${usage}`);
+        scopeMinutes > 0 ? `${scopeMinutes} 分钟` : '已关闭';
+      await reply(ctx, `⏱ 本话题超时设置：${effective}\n全局默认：${formatGlobal()}${usage}`);
       return;
     }
-    await reply(ctx, `⏱ 当前 session 探活:跟随全局(${formatGlobal()})${usage}`);
+    await reply(ctx, `⏱ 本话题超时设置：跟随全局（${formatGlobal()}）${usage}`);
     return;
   }
 
@@ -1023,8 +1393,8 @@ async function handleTimeout(args: string, ctx: CommandContext): Promise<void> {
     await reply(
       ctx,
       cleared
-        ? `✅ 已清除 session 覆盖,回退到全局(${formatGlobal()})。`
-        : `当前 session 本来就没设过覆盖,跟随全局(${formatGlobal()})。`,
+        ? `✅ 已清除本话题的超时设置，回退到全局（${formatGlobal()}）。`
+        : `本话题本来就没有单独设置，跟随全局（${formatGlobal()}）。`,
     );
     return;
   }
@@ -1032,7 +1402,7 @@ async function handleTimeout(args: string, ctx: CommandContext): Promise<void> {
   if (trimmed === 'off' || trimmed === '0') {
     ctx.sessions.setIdleTimeoutMinutes(ctx.scope, 0);
     log.info('command', 'timeout-off', { scope: ctx.scope });
-    await reply(ctx, '✅ 已关闭当前 session 的探活。');
+    await reply(ctx, '✅ 已关闭本话题的探活。');
     return;
   }
 
@@ -1043,7 +1413,7 @@ async function handleTimeout(args: string, ctx: CommandContext): Promise<void> {
   }
   ctx.sessions.setIdleTimeoutMinutes(ctx.scope, n);
   log.info('command', 'timeout-set', { scope: ctx.scope, minutes: n });
-  await reply(ctx, `✅ 当前 session 探活已设为 ${n} 分钟。`);
+  await reply(ctx, `✅ 已把本话题的超时设置为 ${n} 分钟。`);
 }
 
 async function handlePs(_args: string, ctx: CommandContext): Promise<void> {

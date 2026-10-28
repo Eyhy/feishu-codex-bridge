@@ -917,7 +917,7 @@
     <section class="section" id="use">
       <div class="section-heading">
         <h2>五步，从项目到会话</h2>
-        <p>这不是概念图。下面按真实飞书操作还原一次完整使用过程：主 Agent 负责找到项目和创建群；项目群中的任务会自动变成新的话题对话，Codex 只在话题里创建 Session 并回复。</p>
+        <p>这不是概念图。下面按真实飞书操作还原一次完整使用过程：主 Agent 负责找到项目和创建群；项目群中的任务会自动变成新的话题对话，Codex 只在话题里创建会话并回复。</p>
       </div>
 
       <div class="product-demo" data-product-demo data-playing="false">
@@ -970,7 +970,7 @@
           </div>
           <div class="demo-caption" aria-hidden="true">
             <span><strong data-demo-caption-title>入口只有一个：</strong> <span data-demo-caption-copy>私聊主 Agent，不需要记命令。</span></span>
-            <span>项目群 = 工作区&nbsp;&nbsp;·&nbsp;&nbsp;话题 = Codex Session</span>
+            <span>项目群 = 工作区&nbsp;&nbsp;·&nbsp;&nbsp;话题 = Codex 会话</span>
           </div>
           <p class="sr-only" aria-live="polite" data-demo-live>步骤 1：私聊主 Agent，发送“项目”。</p>
         </div>
@@ -1110,7 +1110,7 @@
                 <div>
                   <div class="topic-empty-mark">#</div>
                   <h3>一个话题，一条独立工作线</h3>
-                  <p>直接写任务，不需要 @机器人。发送后 Bridge 会自动新增话题对话并创建 Codex Session；Codex 不在项目群主对话中回复。</p>
+                  <p>直接写任务，不需要 @机器人。发送后 Bridge 会自动新增话题对话并创建 Codex 会话；Codex 不在项目群主对话中回复。</p>
                 </div>
               </div>
             </div>
@@ -1135,7 +1135,7 @@
         </aside>
         <div class="feishu-main">
           <header class="conversation-head">
-            <div class="conversation-title"><strong>更新产品介绍页</strong><span>自动新增的话题对话 · 独立 Codex Session</span></div>
+            <div class="conversation-title"><strong>更新产品介绍页</strong><span>自动新增的话题对话 · 独立 Codex 会话</span></div>
             <span class="head-action">会话进行中</span>
           </header>
           <div class="conversation">
@@ -1149,7 +1149,7 @@
                 <span class="message-avatar agent">C</span>
                 <div class="session-card">
                   <div class="session-head">
-                    <div class="session-head-row"><h3>Codex 正在实现</h3><span class="session-badge">Session 已绑定</span></div>
+                    <div class="session-head-row"><h3>Codex 正在实现</h3><span class="session-badge">会话已绑定</span></div>
                     <p>Codex 只在当前话题对话中回复；后续消息继续同一个上下文。</p>
                   </div>
                   <div class="session-body">
@@ -1173,7 +1173,7 @@
       </div>
       <div class="runway">
         <article class="runway-step"><h3>按项目组织工作</h3><p>Bridge 从 Codex 历史会话和允许的目录中发现本地项目。选择项目后自动创建私有话题群，一个群只对应一个本地工作区。</p></article>
-        <article class="runway-step"><h3>按话题隔离会话</h3><p>在项目群中新建一个飞书原生话题，就会创建一个独立 Codex Session；也可以把历史 Session 恢复成话题继续，不需要接触任何 ID。</p></article>
+        <article class="runway-step"><h3>按话题隔离会话</h3><p>在项目群中新建一个飞书原生话题，就会创建一个独立 Codex 会话；也可以把历史会话恢复成话题继续，不需要接触任何 ID。</p></article>
         <article class="runway-step"><h3>远程掌握执行过程</h3><p>Codex 的回复、工具进度、关键里程碑和最终结果持续回到同一话题。状态卡支持手动刷新与自动同步，只更新卡片，不会刷屏或重新执行任务。</p></article>
         <article class="runway-step"><h3>直接处理任务阻塞</h3><p>当 Codex 等待批准或需要补充信息时，在飞书卡片里完成确认；也可以停止任务、追加要求并继续同一个上下文。</p></article>
       </div>
@@ -1268,7 +1268,7 @@ https://github.com/lengjingxu/feishu-codex-bridge
       <div class="faq">
         <details><summary>需要一台公网服务器吗？</summary><p>不需要。Bridge 在你的电脑上运行，主动连接飞书长连接服务。开发机无需公网 IP、域名或入站端口。</p></details>
         <details><summary>页面上的按钮会直接创建飞书应用吗？</summary><p>不会。按钮只复制安装任务给你的本机 Agent。真正的创建与授权通过本机 CLI 拉起飞书官方确认页完成，避免凭据经过介绍页服务器。</p></details>
-        <details><summary>一个群里的多个任务会串线吗？</summary><p>项目群中的每个飞书原生话题都绑定一个独立 Codex Session。Bridge 会持久化话题与 Session 的映射，重启后可以继续。</p></details>
+        <details><summary>一个群里的多个任务会串线吗？</summary><p>项目群中的每个飞书原生话题都绑定一个独立 Codex 会话。Bridge 会持久化话题与会话的映射，重启后可以继续。</p></details>
         <details><summary>安装时会申请哪些飞书能力？</summary><p>主要用于收发话题消息、创建私有项目群、更新进度卡片、处理审批按钮，以及读取用户主动发送的文件。飞书官方确认页会展示完整差异，只有用户确认后才生效。</p></details>
         <details><summary>谁可以控制我的本机 Agent？</summary><p>Bridge 支持用户、群聊和管理员白名单。正式使用前应限制飞书应用可用范围，并在本机配置最小必要的项目目录。</p></details>
       </div>
@@ -1310,7 +1310,7 @@ https://github.com/lengjingxu/feishu-codex-bridge
         "步骤 2：主 Agent 返回本机项目清单，选择 OpenCraft。",
         "步骤 3：Bridge 创建并绑定 Codex OpenCraft 项目群。",
         "步骤 4：进入项目群，直接输入一个新话题。",
-        "步骤 5：Bridge 自动新增话题对话，Codex 创建 Session 并只在该话题中回复。",
+        "步骤 5：Bridge 自动新增话题对话，Codex 创建会话并只在该话题中回复。",
       ];
       let activeStep = 0;
       let timer = 0;

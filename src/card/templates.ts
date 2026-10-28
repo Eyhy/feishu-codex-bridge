@@ -430,20 +430,67 @@ export interface StatusInfo {
   projectName?: string;
   sessionTitle?: string;
   hideInternalIds?: boolean;
+  /** Present only for Codex; OMP omits the model line entirely. */
+  model?: StatusModelInfo;
+}
+
+export interface StatusModelInfo {
+  displayName?: string;
+  effort?: string;
+  readFailed?: boolean;
+  pendingDisplayName?: string;
+}
+
+export function effortLabel(effort: string): string {
+  switch (effort) {
+    case 'low': return '低';
+    case 'medium': return '中';
+    case 'high': return '高';
+    case 'xhigh': return '极高';
+    case 'ultra': return '最高';
+    default: return effort;
+  }
+}
+
+function modelStatusLine(model: StatusModelInfo): string {
+  if (model.readFailed) {
+    const unknown = '模型：未知（点刷新重试）';
+    return model.pendingDisplayName ? `${unknown}\n待生效：${escapeMd(model.pendingDisplayName)}` : unknown;
+  }
+  if (!model.displayName) {
+    return model.pendingDisplayName
+      ? `模型：${escapeMd(model.pendingDisplayName)}（待生效）`
+      : '模型：尚未开始（发送第一条消息后才有会话模型）';
+  }
+  if (model.pendingDisplayName) {
+    return `模型：${escapeMd(model.displayName)}（待生效：${escapeMd(model.pendingDisplayName)}）`;
+  }
+  const strength = model.effort ? ` · 强度：${escapeMd(effortLabel(model.effort))}` : '';
+  return `模型：${escapeMd(model.displayName)}${strength}`;
 }
 
 export function statusCard(info: StatusInfo): object {
+  const modelLine = info.model ? modelStatusLine(info.model) : '';
+  const refreshAction = info.model?.readFailed
+    ? [{ text: '刷新', value: { cmd: 'status' } }]
+    : [];
+  const modelAction = info.model
+    ? [{ text: '切换模型', value: { cmd: 'model' } }]
+    : [];
   if (info.hideInternalIds) {
     return shell('当前状态', [
       divMd([
         info.projectName ? `项目：**${escapeMd(info.projectName)}**` : '',
         `工作目录：\`${escapeCode(info.cwd)}\``,
         info.sessionTitle ? `当前会话：**${escapeMd(info.sessionTitle)}**` : '当前会话：尚未绑定',
+        modelLine,
         `助手：${escapeMd(info.agentName)}`,
       ].filter(Boolean).join('\n')),
       HR,
       actions([
         { text: '查看会话', value: { cmd: 'sessions' }, style: 'primary' },
+        ...modelAction,
+        ...refreshAction,
         { text: '使用帮助', value: { cmd: 'help' } },
       ]),
     ]);
@@ -451,23 +498,23 @@ export function statusCard(info: StatusInfo): object {
   const sessionLine = info.sessionId
     ? `\`${info.sessionId.slice(0, 8)}…\`${info.sessionStale ? ' ! 旧工作目录，下一条会新建' : ''}`
     : '(无)';
-  // For topic groups, surface that the scope is per-topic so the user
-  // knows /cd / /new only affect this topic.
-  const scopeLine =
-    info.chatMode === 'topic'
-      ? `\`${escapeCode(info.scope)}\` _（话题独立 session）_`
-      : `\`${escapeCode(info.scope)}\``;
+  // Tell the user that /cd and /new only affect this conversation without
+  // exposing the internal scope key.
+  const isolationLine = info.chatMode === 'topic' ? '本话题：独立会话' : '会话：独立';
   const lines = [
-    `范围：${scopeLine}`,
+    isolationLine,
     `工作目录：\`${escapeCode(info.cwd)}\``,
     `会话：${sessionLine}`,
+    modelLine,
     `助手：${escapeMd(info.agentName)}`,
-  ];
+  ].filter(Boolean);
   return shell('当前状态', [
     divMd(lines.join('\n')),
     HR,
     actions([
       { text: '新会话', value: { cmd: 'new' }, style: 'primary' },
+      ...modelAction,
+      ...refreshAction,
       { text: '工作空间', value: { cmd: 'ws.list' } },
       { text: '使用帮助', value: { cmd: 'help' } },
     ]),
@@ -487,7 +534,8 @@ export function helpCard(): object {
         '运行中的任务可以点击卡片上的“停止任务”；需要授权时，直接点击中文确认按钮。',
         '',
         '**高级入口**',
-        '也可以发送 `/projects`、`/sessions`、`/status`、`/stop`、`/new`。',
+        '也可以发送 `/projects`、`/sessions`、`/status`、`/stop`、`/model`、`/new`。',
+        '发送 `/model` 可以切换本话题的模型与推理强度。',
       ].join('\n'),
     ),
     HR,

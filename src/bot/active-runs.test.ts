@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { AgentAdditionalContext, AgentRun, AgentUiResponse } from '../agent/types';
-import { ActiveRuns } from './active-runs';
+import { ActiveRuns, releaseWriterIfAllIdle } from './active-runs';
 
 async function* emptyEvents() {
   return;
@@ -35,6 +35,42 @@ describe('ActiveRuns OMP UI routing', () => {
 
   it('returns false when no active run can accept the response', () => {
     expect(new ActiveRuns().respondToUi('missing', 'ui-1', { cancelled: true })).toBe(false);
+  });
+
+  it('is idle only when no scope has an active run', () => {
+    const activeRuns = new ActiveRuns();
+    const run: AgentRun = {
+      events: emptyEvents(),
+      stop: async () => {},
+      waitForExit: async () => true,
+    };
+    expect(activeRuns.allIdle()).toBe(true);
+    activeRuns.register('scope-1', run);
+    expect(activeRuns.allIdle()).toBe(false);
+    activeRuns.unregister('scope-1', run);
+    expect(activeRuns.allIdle()).toBe(true);
+  });
+
+  it('releases only when all scopes are idle and swallows release failures', async () => {
+    const activeRuns = new ActiveRuns();
+    let releases = 0;
+    const agent = {
+      async releaseWriterIfIdle() {
+        releases += 1;
+        throw new Error('release failed');
+      },
+    };
+    const run: AgentRun = {
+      events: emptyEvents(),
+      stop: async () => {},
+      waitForExit: async () => true,
+    };
+    activeRuns.register('scope-1', run);
+    await releaseWriterIfAllIdle(activeRuns, agent);
+    expect(releases).toBe(0);
+    activeRuns.unregister('scope-1', run);
+    await expect(releaseWriterIfAllIdle(activeRuns, agent)).resolves.toBeUndefined();
+    expect(releases).toBe(1);
   });
 
   it('routes mid-run prompts to the active run', async () => {

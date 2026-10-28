@@ -234,4 +234,55 @@ describe('Codex project command workflow', () => {
     expect(forkSession).toHaveBeenCalledWith('thread-source', project.cwd);
     expect(bindings.findTopic('chat-project', 'topic-fork')).toMatchObject({ codexThreadId: 'thread-fork' });
   });
+
+  it('shows the current Codex thread model on the project status card', async () => {
+    const send = vi.fn().mockResolvedValue({ messageId: 'message-2' });
+    const bindings = new JsonProjectBindingStore(join(await mkdtemp(join(tmpdir(), 'feishu-command-test-')), 'bindings.json'));
+    bindings.registerProjects([project]);
+    await bindings.bindProject(project.projectKey, 'chat-project');
+    await bindings.bindTopic({
+      chatId: 'chat-project', topicId: 'topic-native', projectKey: project.projectKey,
+      codexThreadId: 'thread-1', createdBy: 'user-1', updatedAt: 1,
+    });
+    const readThreadModel = vi.fn().mockResolvedValue({
+      model: 'gpt-6-astra', effort: 'high', loaded: true, canAcceptDirectInput: true,
+    });
+    const listModels = vi.fn().mockResolvedValue([{
+      model: 'gpt-6-astra', id: 'gpt-6-astra', displayName: 'Astra', description: '',
+      isDefault: false, hidden: false, supportedReasoningEfforts: ['high'], defaultReasoningEffort: 'high',
+    }]);
+    const ctx = context({ send }, bindings);
+    ctx.msg.chatId = 'chat-project';
+    ctx.msg.chatType = 'group';
+    ctx.msg.threadId = 'topic-native';
+    ctx.agent = { ...ctx.agent, readThreadModel, listModels };
+
+    await runCommandHandler('status', '', ctx);
+
+    expect(readThreadModel).toHaveBeenCalledWith('thread-1');
+    const card = JSON.stringify(send.mock.lastCall![1].card);
+    expect(card).toContain('模型：Astra · 强度：高');
+  });
+
+  it('marks the model as unknown when the thread read fails', async () => {
+    const send = vi.fn().mockResolvedValue({ messageId: 'message-2' });
+    const bindings = new JsonProjectBindingStore(join(await mkdtemp(join(tmpdir(), 'feishu-command-test-')), 'bindings.json'));
+    bindings.registerProjects([project]);
+    await bindings.bindProject(project.projectKey, 'chat-project');
+    await bindings.bindTopic({
+      chatId: 'chat-project', topicId: 'topic-native', projectKey: project.projectKey,
+      codexThreadId: 'thread-1', createdBy: 'user-1', updatedAt: 1,
+    });
+    const ctx = context({ send }, bindings);
+    ctx.msg.chatId = 'chat-project';
+    ctx.msg.chatType = 'group';
+    ctx.msg.threadId = 'topic-native';
+    ctx.agent = { ...ctx.agent, readThreadModel: vi.fn().mockRejectedValue(new Error('boom')) };
+
+    await runCommandHandler('status', '', ctx);
+
+    const card = JSON.stringify(send.mock.lastCall![1].card);
+    expect(card).toContain('模型：未知（点刷新重试）');
+    expect(card).toContain('刷新');
+  });
 });

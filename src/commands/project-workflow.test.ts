@@ -2,6 +2,7 @@ import { mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
+import { LarkChannel } from '@larksuiteoapi/node-sdk';
 import { ActiveRuns } from '../bot/active-runs';
 import type { CommandContext } from './index';
 import { runCommandHandler, tryHandleCommand } from './index';
@@ -70,16 +71,87 @@ describe('Codex project command workflow', () => {
 
   it('updates the clicked project card instead of sending a duplicate card', async () => {
     const send = vi.fn().mockResolvedValue({ messageId: 'message-2' });
-    const updateCard = vi.fn().mockResolvedValue(undefined);
+    const patch = vi.fn().mockResolvedValue({ code: 0 });
     const bindings = new JsonProjectBindingStore(join(await mkdtemp(join(tmpdir(), 'feishu-command-test-')), 'bindings.json'));
     bindings.registerProjects([project]);
-    const ctx = context({ send, updateCard }, bindings);
+    const ctx = context({ send, rawClient: { im: { v1: { message: { patch } } } } }, bindings);
     ctx.fromCardAction = true;
 
     await runCommandHandler('projects', '', ctx);
 
-    expect(updateCard).toHaveBeenCalledWith('message-1', expect.objectContaining({ header: expect.any(Object) }));
+    expect(patch).toHaveBeenCalledWith({
+      path: { message_id: 'message-1' },
+      data: { content: expect.stringContaining('本地项目') },
+    });
     expect(send).not.toHaveBeenCalled();
+  });
+
+  it('shows sessions when the project sessions button is clicked inside its project group', async () => {
+    const send = vi.fn().mockResolvedValue({ messageId: 'message-2' });
+    const patch = vi.fn().mockResolvedValue({ code: 0 });
+    const bindings = new JsonProjectBindingStore(join(await mkdtemp(join(tmpdir(), 'feishu-command-test-')), 'bindings.json'));
+    bindings.registerProjects([project]);
+    await bindings.bindProject(project.projectKey, 'chat-project');
+    const listSessions = vi.fn().mockResolvedValue([{
+      threadId: 'thread-1', name: '现有会话', preview: '继续修复', cwd: project.cwd,
+      status: 'idle', updatedAt: 1,
+    }]);
+    const ctx = context({ send, rawClient: { im: { v1: { message: { patch } } } } }, bindings);
+    ctx.msg.chatId = 'chat-project';
+    ctx.msg.chatType = 'group';
+    ctx.chatMode = 'group';
+    ctx.fromCardAction = true;
+    ctx.agent = { ...ctx.agent, listSessions };
+
+    await runCommandHandler('project', `sessions ${project.projectKey}`, ctx);
+
+    expect(listSessions).toHaveBeenCalledWith(project.cwd);
+    const finalCard = JSON.parse(patch.mock.lastCall![0].data.content);
+    expect(finalCard.header.title.content).toBe('会话列表');
+    expect(JSON.stringify(finalCard)).toContain('现有会话');
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it('finishes a private-chat project sessions click with instructions to enter the project group', async () => {
+    const send = vi.fn().mockResolvedValue({ messageId: 'message-2' });
+    const patch = vi.fn().mockResolvedValue({ code: 0 });
+    const bindings = new JsonProjectBindingStore(join(await mkdtemp(join(tmpdir(), 'feishu-command-test-')), 'bindings.json'));
+    bindings.registerProjects([project]);
+    await bindings.bindProject(project.projectKey, 'chat-project');
+    const listSessions = vi.fn().mockResolvedValue([]);
+    const ctx = context({ send, rawClient: { im: { v1: { message: { patch } } } } }, bindings);
+    ctx.fromCardAction = true;
+    ctx.agent = { ...ctx.agent, listSessions };
+
+    await runCommandHandler('project', `sessions ${project.projectKey}`, ctx);
+
+    const finalCard = JSON.parse(patch.mock.lastCall![0].data.content);
+    expect(finalCard.header.title.content).toBe('请进入项目群');
+    expect(listSessions).not.toHaveBeenCalled();
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it('sends a session card when Feishu returns a business error while updating the clicked card', async () => {
+    const channel = new LarkChannel({ appId: 'test-app', appSecret: 'test-secret' });
+    const patch = vi.spyOn(channel.rawClient.im.v1.message, 'patch')
+      .mockResolvedValue({ code: 230001, msg: 'mock card update failure' });
+    const send = vi.spyOn(channel, 'send').mockResolvedValue({ messageId: 'message-2' });
+    const bindings = new JsonProjectBindingStore(join(await mkdtemp(join(tmpdir(), 'feishu-command-test-')), 'bindings.json'));
+    bindings.registerProjects([project]);
+    await bindings.bindProject(project.projectKey, 'chat-project');
+    const ctx = context(channel, bindings);
+    ctx.msg.chatId = 'chat-project';
+    ctx.msg.chatType = 'group';
+    ctx.chatMode = 'group';
+    ctx.fromCardAction = true;
+    ctx.agent = { ...ctx.agent, listSessions: vi.fn().mockResolvedValue([]) };
+
+    await runCommandHandler('sessions', '', ctx);
+
+    expect(patch).toHaveBeenCalled();
+    expect(send).toHaveBeenLastCalledWith('chat-project', {
+      card: expect.objectContaining({ header: { title: { tag: 'plain_text', content: '会话列表' } } }),
+    }, { replyTo: 'message-1' });
   });
 
   it('does not create a second project group after a repeated click', async () => {
@@ -93,6 +165,30 @@ describe('Codex project command workflow', () => {
     await runCommandHandler('project', `open ${project.projectKey}`, ctx);
     expect(create).toHaveBeenCalledTimes(1);
     expect(send).toHaveBeenCalledWith('chat-dm', expect.objectContaining({ markdown: expect.stringContaining('已经绑定') }), expect.any(Object));
+  });
+
+  it('creates one project group when two open requests overlap', async () => {
+    let finishCreate!: (value: { data: { chat_id: string } }) => void;
+    const created = new Promise<{ data: { chat_id: string } }>((resolve) => { finishCreate = resolve; });
+    const create = vi.fn().mockReturnValue(created);
+    const send = vi.fn().mockResolvedValue({ messageId: 'message-2' });
+    const patch = vi.fn().mockResolvedValue({ code: 0 });
+    const bindings = new JsonProjectBindingStore(join(await mkdtemp(join(tmpdir(), 'feishu-command-test-')), 'bindings.json'));
+    bindings.registerProjects([project]);
+    const channel = { rawClient: { im: { v1: { chat: { create }, message: { patch } } } }, send };
+    const first = runCommandHandler('project', `open ${project.projectKey}`, context(channel, bindings));
+    const second = runCommandHandler('project', `open ${project.projectKey}`, context(channel, bindings));
+
+    // Keep the remote create pending while both callbacks reach the handler.
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    finishCreate({ data: { chat_id: 'chat-project' } });
+    await Promise.all([first, second]);
+
+    expect(create).toHaveBeenCalledTimes(1);
+    expect(bindings.projectFor(project.projectKey)?.chatId).toBe('chat-project');
+    expect(send).toHaveBeenCalledWith('chat-dm', {
+      markdown: expect.stringContaining('已经绑定项目群'),
+    }, { replyTo: 'message-1' });
   });
 
   it('orders projects by their latest non-archived Codex session', async () => {
@@ -147,12 +243,12 @@ describe('Codex project command workflow', () => {
   });
 
   it('searches sessions from a CardKit form value', async () => {
-    const updateCard = vi.fn().mockResolvedValue(undefined);
+    const patch = vi.fn().mockResolvedValue({ code: 0 });
     const bindings = new JsonProjectBindingStore(join(await mkdtemp(join(tmpdir(), 'feishu-command-test-')), 'bindings.json'));
     bindings.registerProjects([project]);
     await bindings.bindProject(project.projectKey, 'chat-project');
     const listSessionPage = vi.fn().mockResolvedValue({ sessions: [] });
-    const ctx = context({ updateCard }, bindings);
+    const ctx = context({ rawClient: { im: { v1: { message: { patch } } } } }, bindings);
     ctx.msg.chatId = 'chat-project';
     ctx.fromCardAction = true;
     ctx.formValue = { session_search: '卡片修复' };
@@ -165,7 +261,10 @@ describe('Codex project command workflow', () => {
     await runCommandHandler('sessions', 'search', ctx);
 
     expect(listSessionPage).toHaveBeenCalledWith(project.cwd, undefined, '卡片修复');
-    expect(updateCard).toHaveBeenLastCalledWith('message-1', expect.any(Object));
+    expect(patch).toHaveBeenLastCalledWith({
+      path: { message_id: 'message-1' },
+      data: { content: expect.stringContaining('会话列表') },
+    });
   });
 
   it('keeps the real Feishu message id when queuing a task preset', async () => {
@@ -192,7 +291,7 @@ describe('Codex project command workflow', () => {
   it('starts review and compaction for the current topic, then forks it into a new topic', async () => {
     const send = vi.fn()
       .mockResolvedValueOnce({ messageId: 'root-fork' });
-    const updateCard = vi.fn().mockResolvedValue(undefined);
+    const patch = vi.fn().mockResolvedValue({ code: 0 });
     const get = vi.fn().mockResolvedValue({ data: { items: [{ thread_id: 'topic-fork' }] } });
     const bindings = new JsonProjectBindingStore(join(await mkdtemp(join(tmpdir(), 'feishu-command-test-')), 'bindings.json'));
     bindings.registerProjects([project]);
@@ -207,7 +306,7 @@ describe('Codex project command workflow', () => {
       threadId: 'thread-fork', name: '分支会话', preview: '分支', cwd: project.cwd,
       status: 'idle', updatedAt: 2,
     });
-    const ctx = context({ send, updateCard, rawClient: { im: { v1: { message: { get } } } } }, bindings);
+    const ctx = context({ send, rawClient: { im: { v1: { message: { get, patch } } } } }, bindings);
     ctx.msg.chatId = 'chat-project';
     ctx.msg.chatType = 'group';
     ctx.msg.threadId = 'topic-source';

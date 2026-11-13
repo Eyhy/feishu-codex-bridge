@@ -7,6 +7,11 @@ settings:
 overrides:
   esbuild: ^0.28.1
 
+patchedDependencies:
+  '@larksuiteoapi/node-sdk@1.71.1':
+    hash: 2a97403221f6dc922d45ee88a5c70a7489fa0ec1fd0237463b27156c8bef69c7
+    path: patches/@larksuiteoapi__node-sdk@1.71.1.patch
+
 importers:
 
   .:
@@ -16,7 +21,7 @@ importers:
         version: 1.7.0
       '@larksuiteoapi/node-sdk':
         specifier: ^1.71.1
-        version: 1.71.1
+        version: 1.71.1(patch_hash=2a97403221f6dc922d45ee88a5c70a7489fa0ec1fd0237463b27156c8bef69c7)
       commander:
         specifier: ^12.1.0
         version: 12.1.0
@@ -1216,7 +1221,7 @@ snapshots:
       '@jridgewell/resolve-uri': 3.1.2
       '@jridgewell/sourcemap-codec': 1.5.5
 
-  '@larksuiteoapi/node-sdk@1.71.1':
+  '@larksuiteoapi/node-sdk@1.71.1(patch_hash=2a97403221f6dc922d45ee88a5c70a7489fa0ec1fd0237463b27156c8bef69c7)':
     dependencies:
       axios: 1.18.1
       lodash.identity: 3.0.0

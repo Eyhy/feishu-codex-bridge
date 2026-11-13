@@ -81,10 +81,23 @@ describe('OMP UI cards', () => {
     expect(card).toContain('本会话允许');
     expect(card).toContain('拒绝');
     expect(card).toContain('取消任务');
+    expect(card).not.toContain('"tag":"action"');
+    expect(card.match(/"tag":"button"/g)?.length).toBe(4);
     expect(responseFromOmpUiAction(
       { [OMP_UI_MARKER]: true, method: 'approval', action: 'acceptForSession' },
       undefined,
     )).toEqual({ decision: 'acceptForSession' });
+  });
+
+  it('renders confirm buttons as schema 2.0 body elements', () => {
+    const card = JSON.stringify(renderOmpUiRequestCard({
+      id: 'confirm-1',
+      method: 'confirm',
+      title: '需要确认',
+      message: '继续执行吗？',
+    }));
+    expect(card).not.toContain('"tag":"action"');
+    expect(card.match(/"tag":"button"/g)?.length).toBe(3);
   });
 
   it('preserves policy-amendment decisions from Codex', () => {

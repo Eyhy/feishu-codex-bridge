@@ -1,5 +1,6 @@
 import type { LarkChannel } from '@larksuiteoapi/node-sdk';
 import { projectWelcomeCard } from '../card/templates';
+import { updateMessageCard } from '../card/update';
 import type { Project, ProjectBindingStore } from './types';
 import { log } from '../core/logger';
 
@@ -17,7 +18,7 @@ export async function showProjectWorkbench(
   const messageId = targetMessageId ?? project.homeMessageId;
   if (messageId) {
     try {
-      await channel.updateCard(messageId, projectWelcomeCard(project));
+      await updateMessageCard(channel, messageId, projectWelcomeCard(project));
       if (!project.homeMessageId) await bindings.bindProjectHomeMessage(project.projectKey, messageId);
       return;
     } catch (err) {

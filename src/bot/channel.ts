@@ -6,6 +6,7 @@ import type {
 } from '@larksuiteoapi/node-sdk';
 import { Domain, LoggerLevel, createLarkChannel } from '@larksuiteoapi/node-sdk';
 import type { AgentAdapter, AgentUiRequest } from '../agent/types';
+import { deferCardAction } from '../card/deferred-action';
 import { handleCardAction } from '../card/dispatcher';
 import { sendManagedCard, updateManagedCard } from '../card/managed';
 import { renderOmpUiRequestCard, renderOmpUiResultCard } from '../card/omp-ui';
@@ -301,24 +302,29 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
     reject: (evt) => {
       log.info('intake', 'reject', { chatId: evt.chatId, reason: evt.reason });
     },
-    cardAction: async (evt) => {
-      await withTrace({ chatId: evt.chatId, msgId: evt.messageId }, async () => {
-        await handleCardAction({
-          channel,
-          evt,
-          sessions,
-          workspaces,
-          activeRuns,
-          agent,
-          controls,
-          pending,
-          chatModeCache,
-          projectCatalog,
-          projectBindings,
-          sessionSync,
-          taskStore,
-        });
-      }).catch((err) => log.fail('cardAction', err));
+    cardAction: (evt) => {
+      // The SDK sends the click ACK only after this callback returns. Do not
+      // await card updates here: Feishu can overwrite them while settling it.
+      deferCardAction(
+        () => withTrace({ chatId: evt.chatId, msgId: evt.messageId }, async () => {
+          await handleCardAction({
+            channel,
+            evt,
+            sessions,
+            workspaces,
+            activeRuns,
+            agent,
+            controls,
+            pending,
+            chatModeCache,
+            projectCatalog,
+            projectBindings,
+            sessionSync,
+            taskStore,
+          });
+        }),
+        (err) => log.fail('cardAction', err),
+      );
     },
     comment: async (evt) => {
       await withTrace({ chatId: 'comment' }, async () => {

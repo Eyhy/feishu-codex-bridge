@@ -21,6 +21,7 @@ import {
   modelSwitchSuccessCard,
 } from '../card/model-cards';
 import { forgetManagedCard, sendManagedCard, updateManagedCard } from '../card/managed';
+import { updateMessageCard } from '../card/update';
 import {
   effortLabel,
   helpCard,
@@ -265,7 +266,7 @@ async function reply(ctx: CommandContext, markdown: string): Promise<void> {
 async function sendCommandCard(ctx: CommandContext, card: object): Promise<void> {
   if (ctx.fromCardAction) {
     try {
-      await ctx.channel.updateCard(ctx.msg.messageId, card);
+      await updateMessageCard(ctx.channel, ctx.msg.messageId, card);
       return;
     } catch (err) {
       log.warn('command', 'card-update-failed', { err: String(err) });
@@ -408,7 +409,11 @@ async function handleProject(args: string, ctx: CommandContext): Promise<void> {
     if (!project) return reply(ctx, '没有找到这个项目，请重新打开项目列表。');
     const existing = ctx.projectBindings.projectFor(project.projectKey);
     if (existing?.chatId && existing.chatId !== ctx.msg.chatId) {
-      await reply(ctx, '这个项目已经绑定项目群。进入项目群后可直接新建话题开始；需要恢复历史对话时再点击“查看会话”。');
+      await commandFeedback(ctx, '请进入项目群', `请打开飞书中的 **Codex · ${project.name}** 群，在项目工作台点击“查看会话”，即可恢复已有对话。`, []);
+      return;
+    }
+    if (existing?.chatId === ctx.msg.chatId) {
+      await handleSessions('', ctx);
       return;
     }
     await openProject(project.projectKey, ctx);
@@ -429,7 +434,22 @@ async function handleProject(args: string, ctx: CommandContext): Promise<void> {
   await openProject(projectKey, ctx);
 }
 
+const projectOpenQueues = new Map<string, Promise<void>>();
+
 async function openProject(projectKey: string, ctx: CommandContext): Promise<void> {
+  // Separate clicks are valid events, but overlapping opens must recheck the
+  // binding after the first create finishes instead of creating two groups.
+  const previous = projectOpenQueues.get(projectKey) ?? Promise.resolve();
+  const current = previous.catch(() => {}).then(() => openProjectOnce(projectKey, ctx));
+  projectOpenQueues.set(projectKey, current);
+  try {
+    await current;
+  } finally {
+    if (projectOpenQueues.get(projectKey) === current) projectOpenQueues.delete(projectKey);
+  }
+}
+
+async function openProjectOnce(projectKey: string, ctx: CommandContext): Promise<void> {
   if (!ctx.projectCatalog || !ctx.projectBindings) return;
   const project = await ctx.projectCatalog.get(projectKey);
   if (!project) return reply(ctx, '没有找到这个项目，请刷新后重试。');
@@ -464,6 +484,7 @@ async function openProject(projectKey: string, ctx: CommandContext): Promise<voi
 }
 
 async function handleSessions(_args: string, ctx: CommandContext): Promise<void> {
+  log.info('command', 'sessions-start', { projectMode: Boolean(ctx.projectBindings), supportsList: Boolean(ctx.agent.listSessions) });
   if (!ctx.projectBindings || !ctx.agent.listSessions) {
     await reply(ctx, '当前 Bridge 尚未启用 Codex 项目模式。');
     return;
@@ -487,10 +508,13 @@ async function handleSessions(_args: string, ctx: CommandContext): Promise<void>
     return;
   }
   const cursor = rawArgs.startsWith('page ') ? rawArgs.slice(5).trim() : undefined;
+  log.info('command', 'sessions-query-start');
   const page = ctx.agent.listSessionPage
     ? await ctx.agent.listSessionPage(project.cwd, cursor, searchTerm)
     : { sessions: await ctx.agent.listSessions(project.cwd) };
+  log.info('command', 'sessions-query-done', { count: page.sessions.length });
   await sendCommandCard(ctx, sessionsCard(project.name, page.sessions, page.nextCursor));
+  log.info('command', 'sessions-done');
 }
 
 const TASK_PRESETS = [

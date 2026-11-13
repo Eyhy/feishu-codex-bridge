@@ -65,7 +65,10 @@
     "onlyBuiltDependencies": [
       "esbuild",
       "protobufjs"
-    ]
+    ],
+    "patchedDependencies": {
+      "@larksuiteoapi/node-sdk@1.71.1": "patches/@larksuiteoapi__node-sdk@1.71.1.patch"
+    }
   },
   "packageManager": "pnpm@10.26.1",
   "keywords": [

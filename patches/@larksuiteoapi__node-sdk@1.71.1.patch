@@ -1,0 +1,58 @@
+diff --git a/es/index.js b/es/index.js
+index 8196d32573b247aaf3d8b66c6e9cc7df3fcdddc5..82aa3b27c9eb6894404f1f4fbacb3f4c23a4adcd 100644
+--- a/es/index.js
++++ b/es/index.js
+@@ -99563,15 +99563,19 @@ class LarkChannel {
+                 }
+             }),
+             // Card button click — dedup + lock + queue (by chatId).
+-            // The key includes the action's identity (tag + value) so that
+-            // different buttons on the same card by the same user are NOT
+-            // collapsed by the dedup cache. A genuine Feishu re-delivery
+-            // of the same click still hashes to the same key.
++            // Deduplicate deliveries of one click, not separate clicks on the
++            // same button. Hash the fallback token so cache/debug keys cannot
++            // expose the temporary card-update credential.
+             'card.action.trigger': (raw) => __awaiter(this, void 0, void 0, function* () {
+                 const evt = normalizeCardAction(raw, { includeRaw });
+                 if (!evt)
+                     return;
+-                const actionId = cardActionId(evt.action);
++                const eventId = raw.event_id || (raw.header && raw.header.event_id);
++                const actionId = typeof eventId === 'string' && eventId
++                    ? `event:${eventId}`
++                    : typeof raw.token === 'string' && raw.token
++                        ? `token:${crypto.createHash('sha256').update(raw.token).digest('hex')}`
++                        : cardActionId(evt.action);
+                 yield this.safety.pushAction(`card:${evt.messageId}:${evt.operator.openId}:${actionId}`, evt.chatId, () => __awaiter(this, void 0, void 0, function* () {
+                     const h = this.handlers.cardAction;
+                     if (h)
+diff --git a/lib/index.js b/lib/index.js
+index 07f416d716e7d773a0202306d66de41a616cdd8f..55827fdb689597bc7557d5e3b9c85e278dabb2ec 100644
+--- a/lib/index.js
++++ b/lib/index.js
+@@ -99581,15 +99581,19 @@ class LarkChannel {
+                 }
+             }),
+             // Card button click — dedup + lock + queue (by chatId).
+-            // The key includes the action's identity (tag + value) so that
+-            // different buttons on the same card by the same user are NOT
+-            // collapsed by the dedup cache. A genuine Feishu re-delivery
+-            // of the same click still hashes to the same key.
++            // Deduplicate deliveries of one click, not separate clicks on the
++            // same button. Hash the fallback token so cache/debug keys cannot
++            // expose the temporary card-update credential.
+             'card.action.trigger': (raw) => __awaiter(this, void 0, void 0, function* () {
+                 const evt = normalizeCardAction(raw, { includeRaw });
+                 if (!evt)
+                     return;
+-                const actionId = cardActionId(evt.action);
++                const eventId = raw.event_id || (raw.header && raw.header.event_id);
++                const actionId = typeof eventId === 'string' && eventId
++                    ? `event:${eventId}`
++                    : typeof raw.token === 'string' && raw.token
++                        ? `token:${crypto__default["default"].createHash('sha256').update(raw.token).digest('hex')}`
++                        : cardActionId(evt.action);
+                 yield this.safety.pushAction(`card:${evt.messageId}:${evt.operator.openId}:${actionId}`, evt.chatId, () => __awaiter(this, void 0, void 0, function* () {
+                     const h = this.handlers.cardAction;
+                     if (h)

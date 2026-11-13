@@ -79,9 +79,9 @@ export function renderOmpUiRequestCard(request: AgentUiRequest, scope?: string):
       decline: { text: '拒绝', type: 'danger' },
       cancel: { text: '取消任务', type: 'default' },
     };
-    elements.push({
-      tag: 'action',
-      actions: request.decisions.map((decision) => {
+    // Card schema 2.0 does not support the legacy `action` container. Put
+    // buttons directly in the body; the callback behavior remains the same.
+    elements.push(...request.decisions.map((decision) => {
         if (typeof decision === 'string') {
           const label = labels[decision] ?? { text: decision, type: 'default' as const };
           return button(label.text, label.type, callbackValue(request, decision, scope));
@@ -92,18 +92,16 @@ export function renderOmpUiRequestCard(request: AgentUiRequest, scope?: string):
           'default',
           { ...callbackValue(request, 'decision', scope), decision },
         );
-      }),
-    });
+      }));
   } else if (request.method === 'confirm') {
     elements.push(markdown(request.message));
-    elements.push({
-      tag: 'action',
-      actions: [
+    elements.push(
+      ...[
         button('确认', 'primary', callbackValue(request, 'confirm', scope)),
         button('否', 'default', callbackValue(request, 'deny', scope)),
         button('取消', 'danger', callbackValue(request, 'cancel', scope)),
       ],
-    });
+    );
   } else if (request.method === 'select') {
     elements.push(form(request, [
       {
